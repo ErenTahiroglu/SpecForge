@@ -1,0 +1,22 @@
+# Build, environments, secrets and generated output
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+.coverage
+coverage.xml
+dist/
+build/
+*.egg-info/
+.env
+.env.*
+!.env.example
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# IMPORTANT: do not ignore .kiro/ or any of its subdirectories.
