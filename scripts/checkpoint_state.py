@@ -297,11 +297,19 @@ def cmd_verify_cbm(a):
 # separated). Sibling git repositories are ordinary projects. No directory name is built in.
 # A project root is rejected if it is a protected directory, lies inside one, or contains one (an
 # ancestor would index it). Comparison uses file identity (device+inode), so symlink aliases and
-# case variants on case-insensitive volumes cannot hide a path. Anything that cannot be verified
-# fails closed.
+# case variants on case-insensitive volumes cannot hide a path.
+#
+# FAIL CLOSED: a protected set that cannot be established (the sibling directory cannot be listed, an
+# entry cannot be inspected, a stat fails) is UNKNOWN, never empty. It raises ScopeUnverifiable /
+# is reported under "unverified", and verify-scope exits 2, which marks the index stale so the stored
+# baseline does not advance. Only "file or directory does not exist" counts as a verified absence.
 # ---------------------------------------------------------------------------------------------
 LIST_PAGE = 100
 MAX_PAGES = 1000
+
+
+class ScopeUnverifiable(Exception):
+    """The protected-directory set or an identity needed to judge a path could not be established."""
 
 
 def _real(path):
@@ -309,11 +317,19 @@ def _real(path):
 
 
 def _identity(path):
+    """(device, inode) of an existing path; None only if it verifiably does not exist."""
     try:
         st = os.stat(path)
-    except OSError:
+    except (FileNotFoundError, NotADirectoryError):
         return None
+    except OSError as exc:
+        raise ScopeUnverifiable("cannot inspect %s (%s)" % (path, type(exc).__name__))
     return (st.st_dev, st.st_ino)
+
+
+def _has_git(path):
+    """True if `path` contains a .git entry; False only if it verifiably does not."""
+    return _identity(os.path.join(path, ".git")) is not None
 
 
 def _chain(path):
@@ -331,7 +347,7 @@ def _chain(path):
 
 def _nearest_existing(path):
     cur = path
-    while not os.path.exists(cur):
+    while _identity(cur) is None:
         parent = os.path.dirname(cur)
         if parent == cur:
             return cur
@@ -344,48 +360,57 @@ def _split_paths(text):
 
 
 def protected_paths(project_dir, extra=(), allow=()):
-    """Resolved protected directories for this repository (see block comment above)."""
+    """Resolved protected directories for this repository (see block comment above).
+
+    Raises ScopeUnverifiable if the set cannot be established; it never returns a partial set."""
     repo = _real(project_dir)
     container = os.path.dirname(repo)
     found = {}
     if container != repo:
         try:
             entries = sorted(os.scandir(container), key=lambda e: e.name)
-        except OSError:
-            entries = []
+        except OSError as exc:
+            raise ScopeUnverifiable("cannot enumerate the directories next to the repository (%s)" % type(exc).__name__)
         for entry in entries:
             try:
                 if not entry.is_dir(follow_symlinks=True):
                     continue
-            except OSError:
-                continue
+            except OSError as exc:
+                raise ScopeUnverifiable("cannot inspect the sibling entry %r (%s)" % (entry.name, type(exc).__name__))
             real = _real(entry.path)
             if real == repo or os.path.dirname(real) != container:
                 continue            # the repository itself, or a link that leaves the container
-            if os.path.exists(os.path.join(real, ".git")):
+            if _has_git(real):
                 continue            # a sibling git repository is an ordinary project
             found[real] = True
     for p in extra:
         found[_real(p)] = True
-    allowed = {_identity(_real(p)) for p in allow if _identity(_real(p)) is not None}
     allowed_paths = {_real(p) for p in allow}
+    allowed = {i for i in (_identity(p) for p in allowed_paths) if i is not None}
     return sorted(p for p in found if p not in allowed_paths and _identity(p) not in allowed)
 
 
 def check_scope(project_dir, projects, extra=(), allow=()):
-    """Return {ok, violations, unverified, projects_checked, protected_count}."""
-    protected = protected_paths(project_dir, extra, allow)
-    pidents = {i for i in (_identity(p) for p in protected) if i is not None}
-    ancestors = set()
-    for p in protected:
-        cur = os.path.dirname(p)
-        while True:
-            ident = _identity(cur)
-            if ident is not None:
-                ancestors.add(ident)
-            if os.path.dirname(cur) == cur:
-                break
-            cur = os.path.dirname(cur)
+    """Return {ok, violations, unverified, projects_checked, protected_count}.
+
+    ok is True only if the protected set was established AND every project root and repository symlink
+    could be judged AND none reaches a protected directory."""
+    try:
+        protected = protected_paths(project_dir, extra, allow)
+        pidents = {i for i in (_identity(p) for p in protected) if i is not None}
+        ancestors = set()
+        for p in protected:
+            cur = os.path.dirname(p)
+            while True:
+                ident = _identity(cur)
+                if ident is not None:
+                    ancestors.add(ident)
+                if os.path.dirname(cur) == cur:
+                    break
+                cur = os.path.dirname(cur)
+    except ScopeUnverifiable as exc:
+        return {"ok": False, "violations": [], "unverified": [str(exc)],
+                "projects_checked": len(projects), "protected_count": None}
 
     def reach(path):
         real = _real(path)
@@ -404,20 +429,33 @@ def check_scope(project_dir, projects, extra=(), allow=()):
         if not isinstance(root, str) or not root.strip():
             unverified.append("project %r has no root_path" % (row.get("name") if isinstance(row, dict) else row))
             continue
-        why = reach(root)
+        try:
+            why = reach(root)
+        except ScopeUnverifiable as exc:
+            unverified.append("project root: %s" % exc)
+            continue
         if why:
             violations.append({"kind": "indexed_project", "project": row.get("name"), "root_path": root, "reason": why})
     repo = _real(project_dir)
-    for dirpath, dirnames, filenames in os.walk(repo, followlinks=False):
+    walk_errors = []
+    for dirpath, dirnames, filenames in os.walk(repo, followlinks=False, onerror=walk_errors.append):
         dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDE_DIRS)
         for name in sorted(dirnames + filenames):
             full = os.path.join(dirpath, name)
             if not os.path.islink(full):
                 continue
-            why = reach(full)
+            try:
+                why = reach(full)
+            except ScopeUnverifiable as exc:
+                unverified.append("repository symlink %s: %s" % (os.path.relpath(full, repo).replace(os.sep, "/"), exc))
+                continue
             if why:
                 violations.append({"kind": "repository_symlink", "path": os.path.relpath(full, repo).replace(os.sep, "/"),
                                    "reason": why})
+    for exc in walk_errors:
+        where = getattr(exc, "filename", None)
+        rel = os.path.relpath(where, repo).replace(os.sep, "/") if isinstance(where, str) and where.startswith(repo) else "?"
+        unverified.append("cannot read repository directory %s (%s)" % (rel, type(exc).__name__))
     return {"ok": not violations and not unverified, "violations": violations, "unverified": unverified,
             "projects_checked": checked, "protected_count": len(protected)}
 
