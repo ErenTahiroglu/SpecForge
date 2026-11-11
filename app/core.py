@@ -5,6 +5,8 @@ Accepted rows (exact format only, no free-form inference):
   TAG,property,number unit              (files named *.csv only)
   TAG,property,number,unit              (files named *.csv only)
 
+Quoted fields are not part of the grammar: a measurement-like row that uses them is not compared and is
+reported as UNPARSED_ROW.
 Everything the checker cannot use is reported (UNSUPPORTED_UNIT, UNPARSED_ROW,
 DUPLICATE_IDENTIFIER, DIMENSION_MISMATCH, unmatched records), so a clean status is never
 claimed for input that was only partly understood.
@@ -117,10 +119,23 @@ _NUMBER_START = re.compile(r"^\s*(?:approx\.?|about|ca\.?|[~≈<>≤≥±+\-−=
 _TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
 
 
+# Quote characters (ASCII/typographic). Quoting is NOT part of the supported row grammar: a row that uses it is
+# never compared, but it must be reported (issue #10) instead of vanishing from the audit.
+_QUOTE_CHARS = "\"\u201c\u201d\u201e'\u2018\u2019"
+_DOUBLE_QUOTES = re.compile("[\"\u201c\u201d\u201e]")
+_TAG_LIKE = re.compile(r"[A-Za-z][\w-]{1,31}")
+
+
+def _unquote(cell: str) -> str:
+    return cell.strip().strip(_QUOTE_CHARS).strip()
+
+
 def _looks_like_row(raw: str, csv_file: bool) -> bool:
     """A line with 3+ cells whose third cell STARTS like a number, but which no row pattern accepted.
 
     A heading such as `value (2026 rev)` holds a digit but does not start with one, so it is not a measurement.
+    A quoted row (`"P-101","flow","99 L/min"`) is recognised structurally only: the quote characters are removed
+    to see whether the line is shaped like a measurement. Nothing is parsed or compared from it.
     """
     if csv_file:
         cells = raw.split(",")
@@ -129,7 +144,16 @@ def _looks_like_row(raw: str, csv_file: bool) -> bool:
         body = body[1:] if body.startswith("|") else body
         body = body[:-1] if body.endswith("|") else body
         cells = body.split("|")
-    return len(cells) >= 3 and bool(_NUMBER_START.match(cells[2]))
+    if len(cells) >= 3 and _NUMBER_START.match(cells[2]):
+        return True
+    if not any(q in raw for q in _QUOTE_CHARS):
+        return False                                    # unquoted lines keep the rule above, exactly
+    if not csv_file:
+        return len(cells) >= 3 and bool(_NUMBER_START.match(_unquote(cells[2])))
+    # CSV: ignore quoting and embedded commas (a quoted cell may hold a comma or be unterminated).
+    flat = [_unquote(c) for c in _DOUBLE_QUOTES.sub("", raw).split(",")]
+    return (len(flat) >= 3 and bool(_TAG_LIKE.fullmatch(flat[0]))
+            and any(_NUMBER_START.match(c) for c in flat[2:]))
 
 
 def ambiguous_unit(unit: str):
@@ -184,8 +208,10 @@ def _parse(name: str, text: str):
         if not match:
             if _looks_like_row(raw, csv_file):
                 coverage["rows_unparsed"] += 1
-                warnings.append({"code": "UNPARSED_ROW", "document": name, "line": line_number,
-                                 "excerpt": raw.strip(), "reason": "row does not match the supported format"})
+                quoted = any(q in raw for q in _QUOTE_CHARS)
+                warnings.append({"code": "UNPARSED_ROW", "document": name, "line": line_number, "excerpt": raw.strip(),
+                                 "reason": ("row uses quoted fields, which are not supported; it was not compared" if quoted
+                                            else "row does not match the supported format")})
             continue
         tag, field = match["tag"], match["field"].strip()
         value, unit = float(match["value"]), match["unit"]
