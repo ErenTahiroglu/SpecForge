@@ -460,8 +460,21 @@ def check_scope(project_dir, projects, extra=(), allow=()):
             "projects_checked": checked, "protected_count": len(protected)}
 
 
+def _is_int(value):
+    """A real, non-negative integer. bool is a subclass of int and is deliberately NOT accepted."""
+    return type(value) is int and value >= 0
+
+
 def _list_projects():
-    """All projects of the code index (every page). Raises RuntimeError when it cannot be read completely."""
+    """All projects of the code index (every page), validated against the observed schema of
+    codebase-memory-mcp 0.11.0:
+
+        {"projects": [..], "total": int, "offset": int, "limit": int, "returned": int, "has_more": bool,
+         "next_offset": int  (present exactly while has_more is true)}
+
+    A page past the end is {"projects": [], "returned": 0, "has_more": false}. Completeness is accepted only
+    when every page is well formed and consistent and the rows seen add up to `total`; anything else raises
+    RuntimeError (nothing is ever inferred from a missing or malformed field)."""
     import subprocess
     rows, offset, total = [], 0, None
     for _ in range(MAX_PAGES):
@@ -475,22 +488,39 @@ def _list_projects():
             raise RuntimeError("list_projects failed rc=%d" % proc.returncode)
         try:
             body = json.loads(proc.stdout[proc.stdout.index("{"):])
-            page = body["projects"]
-        except (ValueError, KeyError, TypeError):
+        except ValueError:
             raise RuntimeError("list_projects returned unreadable output")
-        if not isinstance(page, list):
+        if not isinstance(body, dict):
             raise RuntimeError("list_projects returned unreadable output")
+        page = body.get("projects")
+        if not isinstance(page, list) or not all(isinstance(p, dict) for p in page):
+            raise RuntimeError("list_projects page has no valid project list")
+        for key in ("total", "offset", "returned"):
+            if not _is_int(body.get(key)):
+                raise RuntimeError("list_projects metadata %r is missing or not an integer" % key)
+        if type(body.get("has_more")) is not bool:
+            raise RuntimeError("list_projects metadata 'has_more' is missing or not a boolean")
+        if body["offset"] != offset:
+            raise RuntimeError("list_projects answered offset %d for a request at %d" % (body["offset"], offset))
+        if body["returned"] != len(page):
+            raise RuntimeError("list_projects reported returned=%d for %d projects" % (body["returned"], len(page)))
+        if total is not None and body["total"] != total:
+            raise RuntimeError("list_projects total changed from %d to %d during the listing" % (total, body["total"]))
+        total = body["total"]
         rows.extend(page)
-        total = body.get("total", total)
-        if not body.get("has_more"):
+        if len(rows) > total:
+            raise RuntimeError("list_projects returned more projects than its total")
+        if not body["has_more"]:
+            if "next_offset" in body:
+                raise RuntimeError("list_projects last page carries a next_offset")
             break
         nxt = body.get("next_offset")
-        if not isinstance(nxt, int) or nxt <= offset:
-            raise RuntimeError("list_projects pagination did not advance")
+        if not _is_int(nxt) or not page or nxt != offset + len(page):
+            raise RuntimeError("list_projects pagination metadata is invalid or does not advance")
         offset = nxt
     else:
         raise RuntimeError("list_projects has too many pages")
-    if isinstance(total, int) and total != len(rows):
+    if total != len(rows):
         raise RuntimeError("list_projects returned %d of %d projects" % (len(rows), total))
     return rows
 

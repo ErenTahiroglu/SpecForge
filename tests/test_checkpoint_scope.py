@@ -167,21 +167,22 @@ def run_cli(tmp_path, ws, bin_dir, extra_env=None):
     return p.returncode, (json.loads(p.stdout) if p.stdout.strip().startswith("{") else p.stdout + p.stderr)
 
 
-def page(rows, total, more, nxt=None):
-    out = {"projects": rows, "total": total, "returned": len(rows), "has_more": more}
+def page(rows, total, more, nxt=None, offset=0):
+    """A page shaped like the real `list_projects --format json` response (codebase-memory-mcp 0.11.0)."""
+    out = {"projects": rows, "total": total, "offset": offset, "limit": 100, "returned": len(rows), "has_more": more}
     if nxt is not None:
         out["next_offset"] = nxt
     return out
 
 
 def test_cli_accepts_a_clean_listing_and_reads_every_page(ws, tmp_path):
-    pages = [page([row(ws.repo), row(ws.ext)], 4, True, 2), page([row(ws.sib), row(ws.ext.parent / "x")], 4, False)]
+    pages = [page([row(ws.repo), row(ws.ext)], 4, True, 2), page([row(ws.sib), row(ws.ext.parent / "x")], 4, False, offset=2)]
     code, out = run_cli(tmp_path, ws, fake_cbm(tmp_path, pages))
     assert code == 0 and out["ok"] and out["projects_checked"] == 4
 
 
 def test_cli_finds_a_private_directory_that_is_only_on_a_later_page(ws, tmp_path):
-    pages = [page([row(ws.repo), row(ws.ext)], 4, True, 2), page([row(ws.sib), row(ws.priv)], 4, False)]
+    pages = [page([row(ws.repo), row(ws.ext)], 4, True, 2), page([row(ws.sib), row(ws.priv)], 4, False, offset=2)]
     code, out = run_cli(tmp_path, ws, fake_cbm(tmp_path, pages))
     assert code == 1 and out["violations"]
 
