@@ -12,6 +12,8 @@
 #   CHECKPOINT_FAULT_INJECT=cbm|graphify   simulate that index command failing (command is NOT run)
 #   CHECKPOINT_PROBE_SYMBOLS="a b"         symbols that must be queryable after refresh (default: audit_documents)
 #   CHECKPOINT_ABSENT_SYMBOLS="x"          symbols that must NOT be present after refresh
+#   CHECKPOINT_PRIVATE_PATHS="/a:/b"       extra directories the code index must never reach
+#   CHECKPOINT_ALLOW_PATHS="/c"            non-git sibling directories that may be indexed
 
 set -uo pipefail
 
@@ -144,12 +146,13 @@ for sym in $ABSENT; do
   if codebase-memory-mcp cli search_graph --project "$PROJECT_ID" --name_pattern "$sym" 2>&1 | grep -q "$sym"; then log "cbm STILL HAS removed '$sym'"; CBM_RESULT="stale"; else log "cbm confirms '$sym' absent"; fi
   if "$PY" -c "import json,sys;g=json.load(open('$GRAPH'));sys.exit(1 if any('$sym' in str(n.get('id',''))+str(n.get('label','')) for n in g['nodes']) else 0)"; then log "graphify confirms '$sym' absent"; else log "graphify STILL HAS removed '$sym'"; GFY_RESULT="stale"; fi
 done
-PROJECTS="$(codebase-memory-mcp cli list_projects 2>&1)"; PROJECTS_RC=$?
-if [ "$PROJECTS_RC" -ne 0 ]; then
-  log "scope: verification failed (list_projects rc=$PROJECTS_RC)"; CBM_RESULT="stale"
-elif echo "$PROJECTS" | grep -q "SpecForge_Private_Strategy"; then
-  log "ERROR: private strategy dir is indexed"; CBM_RESULT="stale"
-else log "scope: private strategy dir not indexed"; fi
+# Scope: no indexed project and no symlink in the repository may reach a protected (private) directory.
+# Protected = non-git directories next to this repository, plus CHECKPOINT_PRIVATE_PATHS, minus
+# CHECKPOINT_ALLOW_PATHS (details: scripts/checkpoint_state.py, verify-scope). Unverifiable = stale.
+"$PY" "$HELPER" verify-scope --project-dir "$PROJECT_DIR" > "$WORK/scope.json" 2>>"$LOG"; SCOPE_RC=$?
+if [ "$SCOPE_RC" -eq 0 ]; then log "scope: private directories not indexed ($(jget "$WORK/scope.json" projects_checked) projects checked)"
+elif [ "$SCOPE_RC" -eq 1 ]; then log "ERROR: a protected private directory is indexed or reachable: $(cat "$WORK/scope.json")"; CBM_RESULT="stale"
+else log "scope: verification failed rc=$SCOPE_RC: $(cat "$WORK/scope.json" 2>/dev/null)"; CBM_RESULT="stale"; fi
 
 # Reject a moving input set before any successful baseline write.
 if ! "$PY" "$HELPER" plan --project-dir "$PROJECT_DIR" --state-dir "$STATE_DIR" \

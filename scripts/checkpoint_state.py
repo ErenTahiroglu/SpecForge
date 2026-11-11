@@ -8,6 +8,7 @@ Subcommands:
   plan    scan sources, compare with stored per-index state, print a JSON plan
   record  store the result of one index refresh (atomic write)
   verify-cbm / verify-graphify   freshness checks after a refresh
+  verify-scope   fail if the code index (or a symlink in the repository) can reach a protected directory
   get     print one key from a JSON file
 """
 import argparse
@@ -288,6 +289,189 @@ def cmd_verify_cbm(a):
     return 0 if not issues else 1
 
 
+# ---------------------------------------------------------------------------------------------
+# Scope protection: private directories must never be indexed.
+#
+# Protected set = every directory next to the repository (same parent) that is NOT a git repository,
+# plus the paths in CHECKPOINT_PRIVATE_PATHS, minus the paths in CHECKPOINT_ALLOW_PATHS (os.pathsep
+# separated). Sibling git repositories are ordinary projects. No directory name is built in.
+# A project root is rejected if it is a protected directory, lies inside one, or contains one (an
+# ancestor would index it). Comparison uses file identity (device+inode), so symlink aliases and
+# case variants on case-insensitive volumes cannot hide a path. Anything that cannot be verified
+# fails closed.
+# ---------------------------------------------------------------------------------------------
+LIST_PAGE = 100
+MAX_PAGES = 1000
+
+
+def _real(path):
+    return os.path.realpath(os.path.expanduser(str(path)))
+
+
+def _identity(path):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def _chain(path):
+    """File identities of path and all its ancestors (path must exist; symlinks already resolved)."""
+    out, cur = set(), path
+    while True:
+        ident = _identity(cur)
+        if ident is not None:
+            out.add(ident)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return out
+        cur = parent
+
+
+def _nearest_existing(path):
+    cur = path
+    while not os.path.exists(cur):
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return cur
+        cur = parent
+    return cur
+
+
+def _split_paths(text):
+    return [p for p in (text or "").split(os.pathsep) if p.strip()]
+
+
+def protected_paths(project_dir, extra=(), allow=()):
+    """Resolved protected directories for this repository (see block comment above)."""
+    repo = _real(project_dir)
+    container = os.path.dirname(repo)
+    found = {}
+    if container != repo:
+        try:
+            entries = sorted(os.scandir(container), key=lambda e: e.name)
+        except OSError:
+            entries = []
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=True):
+                    continue
+            except OSError:
+                continue
+            real = _real(entry.path)
+            if real == repo or os.path.dirname(real) != container:
+                continue            # the repository itself, or a link that leaves the container
+            if os.path.exists(os.path.join(real, ".git")):
+                continue            # a sibling git repository is an ordinary project
+            found[real] = True
+    for p in extra:
+        found[_real(p)] = True
+    allowed = {_identity(_real(p)) for p in allow if _identity(_real(p)) is not None}
+    allowed_paths = {_real(p) for p in allow}
+    return sorted(p for p in found if p not in allowed_paths and _identity(p) not in allowed)
+
+
+def check_scope(project_dir, projects, extra=(), allow=()):
+    """Return {ok, violations, unverified, projects_checked, protected_count}."""
+    protected = protected_paths(project_dir, extra, allow)
+    pidents = {i for i in (_identity(p) for p in protected) if i is not None}
+    ancestors = set()
+    for p in protected:
+        cur = os.path.dirname(p)
+        while True:
+            ident = _identity(cur)
+            if ident is not None:
+                ancestors.add(ident)
+            if os.path.dirname(cur) == cur:
+                break
+            cur = os.path.dirname(cur)
+
+    def reach(path):
+        real = _real(path)
+        anchor = _nearest_existing(real)
+        if _chain(anchor) & pidents:
+            return "inside_or_equal"
+        if anchor == real and _identity(real) in ancestors:
+            return "contains"
+        return None
+
+    violations, unverified = [], []
+    checked = 0
+    for row in projects:
+        checked += 1
+        root = row.get("root_path") if isinstance(row, dict) else None
+        if not isinstance(root, str) or not root.strip():
+            unverified.append("project %r has no root_path" % (row.get("name") if isinstance(row, dict) else row))
+            continue
+        why = reach(root)
+        if why:
+            violations.append({"kind": "indexed_project", "project": row.get("name"), "root_path": root, "reason": why})
+    repo = _real(project_dir)
+    for dirpath, dirnames, filenames in os.walk(repo, followlinks=False):
+        dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDE_DIRS)
+        for name in sorted(dirnames + filenames):
+            full = os.path.join(dirpath, name)
+            if not os.path.islink(full):
+                continue
+            why = reach(full)
+            if why:
+                violations.append({"kind": "repository_symlink", "path": os.path.relpath(full, repo).replace(os.sep, "/"),
+                                   "reason": why})
+    return {"ok": not violations and not unverified, "violations": violations, "unverified": unverified,
+            "projects_checked": checked, "protected_count": len(protected)}
+
+
+def _list_projects():
+    """All projects of the code index (every page). Raises RuntimeError when it cannot be read completely."""
+    import subprocess
+    rows, offset, total = [], 0, None
+    for _ in range(MAX_PAGES):
+        try:
+            proc = subprocess.run(["codebase-memory-mcp", "cli", "list_projects", "--format", "json",
+                                   "--limit", str(LIST_PAGE), "--offset", str(offset)],
+                                  capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("list_projects could not run: %s" % type(exc).__name__)
+        if proc.returncode != 0:
+            raise RuntimeError("list_projects failed rc=%d" % proc.returncode)
+        try:
+            body = json.loads(proc.stdout[proc.stdout.index("{"):])
+            page = body["projects"]
+        except (ValueError, KeyError, TypeError):
+            raise RuntimeError("list_projects returned unreadable output")
+        if not isinstance(page, list):
+            raise RuntimeError("list_projects returned unreadable output")
+        rows.extend(page)
+        total = body.get("total", total)
+        if not body.get("has_more"):
+            break
+        nxt = body.get("next_offset")
+        if not isinstance(nxt, int) or nxt <= offset:
+            raise RuntimeError("list_projects pagination did not advance")
+        offset = nxt
+    else:
+        raise RuntimeError("list_projects has too many pages")
+    if isinstance(total, int) and total != len(rows):
+        raise RuntimeError("list_projects returned %d of %d projects" % (len(rows), total))
+    return rows
+
+
+def cmd_verify_scope(a):
+    extra = _split_paths(os.environ.get("CHECKPOINT_PRIVATE_PATHS"))
+    allow = _split_paths(os.environ.get("CHECKPOINT_ALLOW_PATHS"))
+    try:
+        rows = _list_projects()
+    except RuntimeError as exc:
+        print(json.dumps({"ok": False, "violations": [], "unverified": [str(exc)], "projects_checked": 0}))
+        return 2
+    result = check_scope(a.project_dir, rows, extra, allow)
+    print(json.dumps(result))
+    if result["violations"]:
+        return 1
+    return 0 if result["ok"] else 2
+
+
 def cmd_verify_graphify(a):
     issues = []
     try:
@@ -360,6 +544,9 @@ def main():
     s.add_argument("--scan-file", required=True)
     s.add_argument("--since", type=float, required=True)
     s.set_defaults(fn=cmd_verify_graphify)
+    s = sub.add_parser("verify-scope")
+    s.add_argument("--project-dir", required=True)
+    s.set_defaults(fn=cmd_verify_scope)
     s = sub.add_parser("get")
     s.add_argument("file")
     s.add_argument("key")

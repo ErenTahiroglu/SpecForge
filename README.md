@@ -89,7 +89,7 @@ The optional field `dimension_key` in results is informational (sorted `[dimensi
 - [`.kiro/steering/`](.kiro/steering/): product and engineering rules.
 - [`.kiro/hooks/test-python-on-save.json`](.kiro/hooks/test-python-on-save.json): runs `tests/test_core.py` and `tests/test_api.py` when a Python file in `app/` or `tests/` is saved. The hook command itself was run and passes; a live trigger inside the Kiro IDE has **not** been observed.
 - [`docs/KIRO_CLI_SESSION_01.md`](docs/KIRO_CLI_SESSION_01.md) holds the bootstrap instructions; [`docs/KIRO_CLI_SESSION_01_EXECUTION_LOG.md`](docs/KIRO_CLI_SESSION_01_EXECUTION_LOG.md) is the execution log of the first implementation session, with its provenance note.
-- [`scripts/checkpoint_refresh.sh`](scripts/checkpoint_refresh.sh) and `scripts/checkpoint_state.py` are optional development tooling that refresh local code indexes. They need the external tools `codebase-memory-mcp` and `graphify` and are not needed to run or test the application.
+- [`scripts/checkpoint_refresh.sh`](scripts/checkpoint_refresh.sh) and `scripts/checkpoint_state.py` are optional development tooling that refresh local code indexes. They need the external tools `codebase-memory-mcp` and `graphify` and are not needed to run or test the application. After each refresh the script checks that the code index cannot reach a private directory: every non-git directory next to the repository (plus `CHECKPOINT_PRIVATE_PATHS`, minus `CHECKPOINT_ALLOW_PATHS`; both are `:`-separated paths) is protected, and an indexed project inside, equal to or above one, or a symlink in the repository leading to one, marks the index stale. If the check cannot run, the index is also marked stale.
 
 ## Kiroween submission status
 
