@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "specforge": {
+      "command": "python",
+      "args": ["-m", "app.mcp_server"],
+      "disabled": false,
+      "autoApprove": []
+    }
+  }
+}

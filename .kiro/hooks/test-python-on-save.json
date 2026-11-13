@@ -1,0 +1,17 @@
+{
+  "version": "v1",
+  "hooks": [
+    {
+      "name": "engineering-auditor-quick-tests",
+      "description": "Run deterministic and property-based checks when Python files are saved",
+      "trigger": "PostFileSave",
+      "matcher": "(^|[/\\\\])(app|tests)[/\\\\].*\\.py$",
+      "action": {
+        "type": "command",
+        "command": "python -m pytest -q tests/test_core.py tests/test_api.py"
+      },
+      "timeout": 90,
+      "enabled": true
+    }
+  ]
+}

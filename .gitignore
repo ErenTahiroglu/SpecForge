@@ -19,4 +19,9 @@ build/
 .vscode/
 *.log
 
+# Local development tooling output (never published)
+graphify-out/
+.checkpoint-logs/
+*.bak-*
+
 # IMPORTANT: do not ignore .kiro/ or any of its subdirectories.
