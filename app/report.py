@@ -51,6 +51,8 @@ class Evidence:
     document: str   # name as given to the engine
     location: str   # human-readable location, honest for PDF pages
     excerpt: str    # verbatim source text
+    quantity: str = ""   # the value and unit as written, e.g. "10 bar"
+    si: str = ""         # the same value in SI, e.g. "1,000,000 Pa"
 
 
 @dataclass
@@ -90,6 +92,7 @@ class AuditView:
     files: list = field(default_factory=list)          # str descriptions
     scope: str = ""
     tolerance: float = 0.0
+    coverage_complete: bool = False   # the authoritative flag (core.audit_verdict), including input issues
 
 
 # Pint's names for SI base-unit combinations -> the symbols engineers use.
@@ -122,7 +125,8 @@ def describe_location(name: str, line: int) -> str:
 
 
 def _evidence(label: str, rec: dict) -> Evidence:
-    return Evidence(label, rec["document"], describe_location(rec["document"], rec["line"]), rec["excerpt"])
+    return Evidence(label, rec["document"], describe_location(rec["document"], rec["line"]), rec["excerpt"],
+                    _quantity(rec), _si(rec))
 
 
 def _doc_label(name: str, labels: dict) -> str:
@@ -241,7 +245,7 @@ def build_view(result: dict, labels: Optional[dict] = None, input_issues: Option
         "equivalent": len(equivalents), "not_compared": gaps,
     }
     internal = sum(1 for f in result["findings"] if f["code"] == "INTERNAL_CONTRADICTION")
-    verdict, _complete = audit_verdict(result, extra_gaps=len(input_issues))
+    verdict, complete = audit_verdict(result, extra_gaps=len(input_issues))
     if verdict == VERDICT_CONFLICTS:
         headline = f"{n_conf} conflict{'s' if n_conf != 1 else ''} found"
         if n_comp:
@@ -249,6 +253,9 @@ def build_view(result: dict, labels: Optional[dict] = None, input_issues: Option
         if internal:
             headline += f" ({internal} inside one document)"
         detail = "Check the evidence below. SpecForge reports what the documents say. It does not decide which document is right."
+        if gaps:
+            detail += (f" The audit is also incomplete: {gaps} item{'s were' if gaps != 1 else ' was'} not compared."
+                       " Read the coverage section.")
     elif verdict == VERDICT_NONE:
         headline = "Nothing could be compared"
         detail = "No tag and property pair with a usable value was found in two places. This is not a successful audit. See the coverage section."
@@ -259,7 +266,7 @@ def build_view(result: dict, labels: Optional[dict] = None, input_issues: Option
         headline = f"No conflicts in the {n_comp} compared measurement{'s' if n_comp != 1 else ''}"
         detail = "This covers only rows in the supported format. It is not a certification of the documents."
     return AuditView(verdict, headline, detail, metrics, conflicts, equivalents, coverage, notes, internal, input_issues,
-                     list(files or []), result["scope"], tol)
+                     list(files or []), result["scope"], tol, complete)
 
 
 def _where(ev) -> str:
@@ -292,6 +299,9 @@ def render_markdown(view: AuditView, generated_at: Optional[str] = None) -> str:
     if generated_at:
         out += [f"Generated: {generated_at}", ""]
     out += [f"**Result: {e(view.headline)}**", "", e(view.detail), ""]
+    out += [f"Verdict: {view.verdict}", "", f"Coverage complete: {'yes' if view.coverage_complete else 'no'}"
+            + ("" if view.coverage_complete else f" ({view.metrics['not_compared']} items not compared)")
+            + " (within the supported structured rows; not a certification of the documents)", ""]
     out += ["## Input files", ""]
     out += [f"- {e(f)}" for f in view.files] or ["- (none)"]
     out += ["", "## Summary", "", "| Measure | Count |", "| --- | --- |"]
