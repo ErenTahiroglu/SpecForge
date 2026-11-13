@@ -1,0 +1,7 @@
+tag,property,value
+# Pump station PS-1: purchasing sheet (synthetic example, not from any real project or supplier)
+P-101,pressure,900 kPa
+P-101,flow,0.0002 m^3/s
+P-101,motor_power,3.7 kW
+V-201,inner_diameter,0.025 m
+"T-301","design_temperature","95 degC"
