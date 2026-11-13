@@ -177,3 +177,17 @@ def test_streamlit_ui_shows_partial_coverage_not_a_success_banner():
     assert audit["view"].verdict == report.VERDICT_PARTIAL and len(audit["view"].coverage) == 2
     assert "99 L/min" in audit["markdown"] and "incomplete" in audit["markdown"].lower()
     assert json.loads(audit["json"])["result"]["coverage"]["a.csv"]["rows_unparsed"] == 1
+
+
+def test_streamlit_json_export_carries_the_same_verdict_and_completeness():
+    at = _app()
+    at.run()
+    at.get("file_uploader")[0].upload("a.csv", BOTH_A.encode(), "text/csv")
+    at.get("file_uploader")[1].upload("b.csv", BOTH_B.encode(), "text/csv")
+    at.run()
+    next(b for b in at.button if b.label == "Run audit").click().run()
+    audit = at.session_state["audit"]
+    exported = json.loads(audit["json"])
+    assert exported["verdict"] == audit["view"].verdict == report.VERDICT_PARTIAL
+    assert exported["coverage_complete"] is False
+    assert exported["result"]["verdict"] == exported["verdict"]

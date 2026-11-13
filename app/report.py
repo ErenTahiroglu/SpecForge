@@ -14,14 +14,11 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .ingest import split_document_name
-from .core import UNITS
+from .core import UNITS, VERDICT_CONFLICTS, VERDICT_MATCH, VERDICT_NONE, VERDICT_PARTIAL, audit_verdict
 
 PRESSURE_DIMENSION = UNITS.pascal.dimensionality
 
-VERDICT_CONFLICTS = "CONFLICTS_FOUND"
-VERDICT_PARTIAL = "NO_CONFLICTS_PARTIAL_COVERAGE"
-VERDICT_MATCH = "NO_CONFLICTS_IN_COMPARED_ROWS"
-VERDICT_NONE = "NOTHING_COMPARED"
+# VERDICT_* and the decision itself live in app.core (audit_verdict) so every interface shares one rule.
 
 REASONS = {
     "UNSUPPORTED_UNIT": "Unit is not supported. The row was not compared.",
@@ -244,24 +241,21 @@ def build_view(result: dict, labels: Optional[dict] = None, input_issues: Option
         "equivalent": len(equivalents), "not_compared": gaps,
     }
     internal = sum(1 for f in result["findings"] if f["code"] == "INTERNAL_CONTRADICTION")
-    if n_conf:
-        verdict = VERDICT_CONFLICTS
+    verdict, _complete = audit_verdict(result, extra_gaps=len(input_issues))
+    if verdict == VERDICT_CONFLICTS:
         headline = f"{n_conf} conflict{'s' if n_conf != 1 else ''} found"
         if n_comp:
             headline += f" in {n_comp} compared measurement{'s' if n_comp != 1 else ''}"
         if internal:
             headline += f" ({internal} inside one document)"
         detail = "Check the evidence below. SpecForge reports what the documents say. It does not decide which document is right."
-    elif n_comp == 0:
-        verdict = VERDICT_NONE
+    elif verdict == VERDICT_NONE:
         headline = "Nothing could be compared"
         detail = "No tag and property pair with a usable value was found in two places. This is not a successful audit. See the coverage section."
-    elif gaps:
-        verdict = VERDICT_PARTIAL
+    elif verdict == VERDICT_PARTIAL:
         headline = f"No conflicts in the {n_comp} compared measurement{'s' if n_comp != 1 else ''}, but the audit is incomplete"
         detail = f"{gaps} item{'s were' if gaps != 1 else ' was'} not compared. Read the coverage section before relying on this result."
     else:
-        verdict = VERDICT_MATCH
         headline = f"No conflicts in the {n_comp} compared measurement{'s' if n_comp != 1 else ''}"
         detail = "This covers only rows in the supported format. It is not a certification of the documents."
     return AuditView(verdict, headline, detail, metrics, conflicts, equivalents, coverage, notes, internal, input_issues,

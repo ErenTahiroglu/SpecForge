@@ -277,6 +277,38 @@ def _temperature_pair(ref: Observation, other: Observation):
     return None
 
 
+# Authoritative audit verdicts. `status` below keeps the original comparison outcome; `verdict` is what consumers
+# should branch on. The presentation layer (app/report.py) re-exports these names and uses `audit_verdict`.
+VERDICT_CONFLICTS = "CONFLICTS_FOUND"
+VERDICT_PARTIAL = "NO_CONFLICTS_PARTIAL_COVERAGE"
+VERDICT_MATCH = "NO_CONFLICTS_IN_COMPARED_ROWS"
+VERDICT_NONE = "NOTHING_COMPARED"
+
+
+def count_coverage_gaps(result: Mapping) -> int:
+    """Items that reduce coverage: every warning except a consistent repeat (informational), plus unmatched rows."""
+    gaps = sum(1 for w in result["warnings"]
+               if not (w["code"] == "DUPLICATE_IDENTIFIER" and w.get("consistent", False)))
+    return gaps + len(result["unmatched"])
+
+
+def audit_verdict(result: Mapping, extra_gaps: int = 0) -> tuple[str, bool]:
+    """Single source of truth for (verdict, coverage_complete).
+
+    `coverage_complete` is True only when rows were compared and nothing in the supported structured-row scope was left
+    out (no unparsed, unmatched, unusable or ambiguous rows). It is not a certification of the documents.
+    Precedence: conflicts first (coverage_complete still reports gaps), then nothing compared, then partial, then match.
+    `extra_gaps` lets a caller add gaps core cannot see (for example files that could not be read).
+    """
+    gaps = count_coverage_gaps(result) + extra_gaps
+    complete = gaps == 0 and result["comparisons"] > 0
+    if result["findings"]:
+        return VERDICT_CONFLICTS, complete
+    if result["comparisons"] == 0:
+        return VERDICT_NONE, False
+    return (VERDICT_PARTIAL if gaps else VERDICT_MATCH), complete
+
+
 def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> dict:
     """Compare equal TAG+field measurements across uploaded files, reporting evidence from both rows.
 
@@ -376,10 +408,12 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
             else:
                 matches.append({"code": "WITHIN_TOLERANCE", **item})
     warnings.extend(group_warnings)
-    return {
+    result = {
         "status": "DIFFERENCES" if findings else ("NO_COMPARABLE_ROWS" if not comparisons else "NO_DIFFERENCES_FOUND"),
         "records": len(all_records), "comparisons": comparisons,
         "tolerance": tolerance, "findings": findings, "matches": matches,
         "unmatched": unmatched, "warnings": warnings, "coverage": coverage,
         "scope": SCOPE,
     }
+    result["verdict"], result["coverage_complete"] = audit_verdict(result)
+    return result

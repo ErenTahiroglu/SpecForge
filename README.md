@@ -50,6 +50,16 @@ curl -s http://127.0.0.1:8000/audit -H 'content-type: application/json' \
 
 `POST /audit` takes 1–12 named documents and an optional `tolerance`. Each document is limited to 200,000 characters and 5,000 lines.
 
+#### Result fields: `status`, `verdict`, `coverage_complete`
+
+Every result (core, `POST /audit`, the MCP tool and the JSON export) carries three top-level outcome fields. Consumers should branch on `verdict` and `coverage_complete`.
+
+- `status`: the original comparison outcome, kept for backward compatibility: `DIFFERENCES`, `NO_COMPARABLE_ROWS` or `NO_DIFFERENCES_FOUND`. **`NO_DIFFERENCES_FOUND` alone never means the audit was complete**; it can appear together with warnings and unmatched rows.
+- `verdict`: the authoritative outcome, shared with the web interface and the Markdown report. Precedence, first match wins: `CONFLICTS_FOUND` (any finding; this wins even when coverage is incomplete), `NOTHING_COMPARED` (no comparison was made), `NO_CONFLICTS_PARTIAL_COVERAGE` (compared rows agree, but at least one coverage gap exists), `NO_CONFLICTS_IN_COMPARED_ROWS` (compared rows agree and there is no gap).
+- `coverage_complete`: `true` only if at least one comparison was made and there is no coverage gap *within the supported structured-row scope*. It is not a certification of an entire document. Gaps are unparsed or unsupported rows (`UNPARSED_ROW`, `UNSUPPORTED_UNIT`, `AMBIGUOUS_UNIT`), unmatched rows, dimension or temperature mismatches, ambiguous comparisons and inconsistent repeats. A consistent repeat of the same value in one file is an informational note, not a gap. A conflict with complete coverage gives `CONFLICTS_FOUND` with `coverage_complete: true`; a conflict with a gap gives `CONFLICTS_FOUND` with `coverage_complete: false`.
+
+The web interface's JSON download adds the same two fields at its top level; there they also count input problems such as an unreadable file, which the audit engine never sees.
+
 ### Demonstration
 
 The files in [`examples/`](examples/) are synthetic fixtures. Comparing `examples/spec.md` with `examples/bom.md` must give exactly one conflict, `P-101 / pressure` (`10 bar` against `900 kPa`, a 10 % difference), and two equivalent pairs: `12 L/min = 0.0002 m^3/s` and `25 mm = 0.025 m`.
@@ -67,6 +77,8 @@ Kiro's MCP configuration has no working-directory field, so this entry works onl
 1. `python` on `PATH` is the interpreter that has the dependencies installed (activate the virtual environment before starting Kiro from that shell).
 2. The server process starts in the repository root so that `app.mcp_server` can be imported.
 
+The tool accepts pipe-delimited rows only. It receives no filenames, so it **does not enable CSV grammar** (that is chosen from a `.csv` filename): comma-separated input is not safely audited by this interface, and a CSV row can be missed without a warning. Use the web interface or `POST /audit` with `.csv` document names for CSV. Its result carries `verdict` and `coverage_complete` as described above.
+
 If either is not true, replace `command` with the absolute path of the project's Python. Do not add the tool to `autoApprove`. The stdio handshake and tool call were verified with this configuration from the repository root; a call from inside the Kiro IDE has **not** been verified.
 
 ## Source format and limits
@@ -75,7 +87,7 @@ One measurement per line: `P-101 | pressure | 10 bar`. Markdown table rows with 
 
 Units with more than one meaning are refused, not guessed: `ton`, `gallon`, `quart`, `pint`, `cal`, `hp`, `Btu`, `bbl`/`barrel` and their short or plural forms. Use an explicit unit such as `short_ton`, `tonne`, `US_liquid_gallon`, `imperial_gallon`, `international_calorie`, `metric_horsepower` or `oil_barrel`. Temperature differences (`delta_degC`, or a property named difference, rise, drop or delta T) are never compared with absolute temperatures.
 
-Not supported: scanned PDFs, OCR, drawings, P&ID images, free text, decimal commas (`10,5`), scientific notation (`1e3`), and gauge/absolute pressure units (`barg`, `bara`). Rows with a decimal comma, an exponent or an unsupported unit are reported as `UNPARSED_ROW` or `UNSUPPORTED_UNIT` warnings and are not compared. Quoted fields (`"P-101","pressure","10 bar"`, also in pipe rows) are not supported: a measurement-like row that uses them is **not compared** and is reported as an `UNPARSED_ROW` warning with its document, line and text, so the audit shows as incomplete (never as a clean pass). A non-measurement quoted line, such as a header, is not reported.
+Not supported: scanned PDFs, OCR, drawings, P&ID images, free text, decimal commas (`10,5`), scientific notation (`1e3`), and gauge/absolute pressure units (`barg`, `bara`). Rows with a decimal comma, an exponent or an unsupported unit are reported as `UNPARSED_ROW` or `UNSUPPORTED_UNIT` warnings and are not compared. Quoted fields (`"P-101","pressure","10 bar"`, also in pipe rows) are not supported: a measurement-like row that uses them is **not compared** and is reported as an `UNPARSED_ROW` warning with its document, line and text, so the audit shows as incomplete (never as a clean pass). This applies where the quoted row is recognised: pipe rows anywhere, and comma rows in `.csv` documents, not in the MCP tool (see above). A non-measurement quoted line, such as a header, is not reported.
 
 The optional field `dimension_key` in results is informational (sorted `[dimension]^exponent` terms, or `dimensionless`). The engine compares Pint dimensionality directly.
 

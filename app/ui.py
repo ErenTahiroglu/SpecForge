@@ -13,7 +13,7 @@ if str(ROOT) not in sys.path:
 
 import streamlit as st  # noqa: E402
 
-from app.core import audit_documents  # noqa: E402
+from app.core import audit_documents, audit_verdict  # noqa: E402
 from app.ingest import SUPPORTED_EXTENSIONS, SUPPORTED_FORMATS_TEXT, ingest_upload, input_fingerprint, unique_names  # noqa: E402
 from app.report import (  # noqa: E402
     VERDICT_CONFLICTS, VERDICT_MATCH, build_view, escape_md, evidence_html, render_markdown, table_rows,
@@ -116,11 +116,14 @@ def _run_audit():
     labels[key_a], labels[key_b] = "Document A", "Document B"
     result = audit_documents(docs, tol_pct / 100)
     view = build_view(result, labels, issues, files)
+    # Export-level verdict: the core verdict plus input problems (for example an unreadable file) the core never saw.
+    verdict, coverage_complete = audit_verdict(result, extra_gaps=len(issues))
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     st.session_state["audit"] = {
         "blocked": False, "view": view, "result": result,
         "markdown": render_markdown(view, stamp),
-        "json": json.dumps({"result": result, "input_issues": issues}, indent=2, ensure_ascii=False),
+        "json": json.dumps({"verdict": verdict, "coverage_complete": coverage_complete,
+                            "result": result, "input_issues": issues}, indent=2, ensure_ascii=False),
         "input_key": _current_key(),
     }
 
