@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import time
@@ -442,7 +443,16 @@ def check_scope(project_dir, projects, extra=(), allow=()):
         dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDE_DIRS)
         for name in sorted(dirnames + filenames):
             full = os.path.join(dirpath, name)
-            if not os.path.islink(full):
+            try:
+                is_link = stat.S_ISLNK(os.lstat(full).st_mode)
+            except (FileNotFoundError, NotADirectoryError):
+                continue            # the entry vanished while walking: nothing there to judge
+            except OSError as exc:
+                # os.path.islink() would turn this into "not a symlink". An entry that cannot be inspected is unverified.
+                unverified.append("cannot inspect repository entry %s (%s)" % (
+                    os.path.relpath(full, repo).replace(os.sep, "/"), type(exc).__name__))
+                continue
+            if not is_link:
                 continue
             try:
                 why = reach(full)
