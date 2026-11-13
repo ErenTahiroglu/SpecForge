@@ -483,10 +483,12 @@ def _list_projects():
          "next_offset": int  (present exactly while has_more is true)}
 
     A page past the end is {"projects": [], "returned": 0, "has_more": false}. Completeness is accepted only
-    when every page is well formed and consistent and the rows seen add up to `total`; anything else raises
+    when every page is well formed and consistent (`limit` a positive integer, `has_more` equal to
+    offset + returned < total) and the DISTINCT project names seen add up to `total`: a repeated `name`, within a page or
+    across pages, raises instead of being deduplicated. Distinct names may share one root (aliases). Anything else raises
     RuntimeError (nothing is ever inferred from a missing or malformed field)."""
     import subprocess
-    rows, offset, total = [], 0, None
+    rows, offset, total, seen = [], 0, None, set()
     for _ in range(MAX_PAGES):
         try:
             proc = subprocess.run(["codebase-memory-mcp", "cli", "list_projects", "--format", "json",
@@ -510,13 +512,29 @@ def _list_projects():
                 raise RuntimeError("list_projects metadata %r is missing or not an integer" % key)
         if type(body.get("has_more")) is not bool:
             raise RuntimeError("list_projects metadata 'has_more' is missing or not a boolean")
+        limit = body.get("limit")
+        if type(limit) is not int or limit < 1:
+            raise RuntimeError("list_projects metadata 'limit' is missing or not a positive integer")
         if body["offset"] != offset:
             raise RuntimeError("list_projects answered offset %d for a request at %d" % (body["offset"], offset))
         if body["returned"] != len(page):
             raise RuntimeError("list_projects reported returned=%d for %d projects" % (body["returned"], len(page)))
         if total is not None and body["total"] != total:
             raise RuntimeError("list_projects total changed from %d to %d during the listing" % (total, body["total"]))
+        if body["returned"] > limit:
+            raise RuntimeError("list_projects returned %d projects for a limit of %d" % (body["returned"], limit))
         total = body["total"]
+        if body["has_more"] != (offset + len(page) < total):
+            raise RuntimeError("list_projects 'has_more' disagrees with offset %d + returned %d and total %d"
+                               % (offset, len(page), total))
+        for project in page:
+            name = project.get("name")
+            if not isinstance(name, str) or not name:
+                raise RuntimeError("list_projects row has no usable project name")
+            if name in seen:
+                raise RuntimeError("list_projects repeats a project identity (duplicate name); the listing cannot be "
+                                   "complete")
+            seen.add(name)
         rows.extend(page)
         if len(rows) > total:
             raise RuntimeError("list_projects returned more projects than its total")

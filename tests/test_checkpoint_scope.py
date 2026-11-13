@@ -39,8 +39,9 @@ def ws(tmp_path):
     return SimpleNamespace(root=root, repo=repo, priv=priv, other=other, sib=sib, ext=ext)
 
 
-def row(path, name="p"):
-    return {"name": name, "root_path": str(path)}
+def row(path, name=None):
+    # Project name is the listing identity and must be unique per listing: default to one derived from the root.
+    return {"name": str(path) if name is None else name, "root_path": str(path)}
 
 
 def check(ws, rows, **kw):
