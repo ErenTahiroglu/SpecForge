@@ -64,6 +64,17 @@ The web interface's JSON download adds the same two fields at its top level; the
 
 The files in [`examples/`](examples/) are synthetic fixtures. Comparing `examples/spec.md` with `examples/bom.md` must give exactly one conflict, `P-101 / pressure` (`10 bar` against `900 kPa`, a 10 % difference), and two equivalent pairs: `12 L/min = 0.0002 m^3/s` and `25 mm = 0.025 m`.
 
+### Demonstration: pump station (synthetic)
+
+[`examples/pump_station/`](examples/pump_station/) holds a fully synthetic two-document case (a specification and a purchasing sheet). It is teaching data, not from any real project, customer or supplier. To reproduce it: start the web interface, tick **Use an example**, choose **Pump station**, press **Run audit** (or upload `spec.md` as Document A and `purchasing.csv` as Document B). The result is fixed:
+
+- Verdict `CONFLICTS_FOUND` and `coverage_complete = false`, shown as "Conflicts found" and "Coverage incomplete: 4 items not compared".
+- One conflict, `P-101 · pressure`: `10 bar` (spec.md, line 5) against `900 kPa` (purchasing.csv, line 3), that is 1,000,000 Pa against 900,000 Pa, a 10 % difference.
+- Two verified equivalences: `12 L/min` = `0.0002 m^3/s` and `25 mm` = `0.025 m`.
+- Four items not compared, each shown with its source row: `5 hp` (the unit `hp` has more than one meaning, so it is not guessed and not matched to `3.7 kW`), the quoted CSV row `"T-301","design_temperature","95 degC"` (quoted fields are not supported, so the `80 degC` in the specification stays unmatched), and the two rows left without a partner.
+
+The numbers are checked in `tests/test_r6a_pump_station_case.py` with plain arithmetic, independent of the unit library.
+
 ## Kiro MCP tool
 
 [`.kiro/settings/mcp.json`](.kiro/settings/mcp.json) registers a read-only stdio server with one tool, `compare_engineering_rows`:
