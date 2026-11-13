@@ -1,10 +1,15 @@
-fastapi>=0.115,<1
-uvicorn>=0.34,<1
-pint>=0.24,<1
-pydantic>=2.8,<3
-streamlit>=1.42,<2
-pypdf>=5,<7
-mcp>=1.10,<2
-hypothesis>=6.100,<7
-pytest>=8,<10
-httpx>=0.27,<1
+# Direct dependencies, pinned to the versions installed and tested in clean environments on Python 3.11 and 3.12
+# (GitHub Actions, local pytest and the real-browser QA used these versions). This pins direct dependencies only;
+# transitive dependencies are resolved by pip and are not locked.
+# Pint 0.26.x requires Python >= 3.12, so each Python version gets the Pint release it was tested with.
+fastapi==0.162.6
+uvicorn==0.54.0
+Pint==0.25.3; python_version < "3.12"
+Pint==0.26.2; python_version >= "3.12"
+pydantic==2.14.3
+streamlit==1.67.0
+pypdf==6.21.4
+mcp==1.30.0
+hypothesis==6.170.15
+pytest==9.2.0
+httpx==0.28.1

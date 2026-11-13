@@ -1,10 +1,26 @@
 # SpecForge — Engineering Specification and SI-Unit Auditor
 
-SpecForge compares measurements in two engineering documents. It reads structured rows such as `P-101 | pressure | 10 bar`, converts the values to SI units with [Pint](https://pint.readthedocs.io/), and reports differences with the exact document, line and original text of both sides. It runs locally, uses no network and no language model, and decides every comparison deterministically.
+SpecForge compares measurements in two engineering documents. It reads structured rows such as `P-101 | pressure | 10 bar`, converts the values to SI units with [Pint](https://pint.readthedocs.io/), and reports differences with the exact document, line and original text of both sides. The audit engine uses no language model and no external AI API, makes no network calls of its own, and decides every comparison deterministically. Where the computation happens depends on how you run it; see [Local and hosted operation](#local-and-hosted-operation).
 
 It is a Kiroween 2026 **Frankenstein** candidate, developed with Kiro (specifications, steering, hooks and an MCP tool are in [`.kiro/`](.kiro/)).
 
 **Status:** a working local application. It is **not hosted** (there is no public URL yet), it is **not a certification** of any document, and a result without conflicts covers only the rows that were actually compared.
+
+## Local and hosted operation
+
+### Local operation
+
+- When you run `python -m streamlit run app/ui.py` on your own machine, the audit is computed on that machine. Uploaded files go only to the local Streamlit server on your computer.
+- The deterministic audit uses no external AI API and no language model.
+- [`.streamlit/config.toml`](.streamlit/config.toml) sets `gatherUsageStats = false`, so Streamlit's own usage statistics are not collected in local runs that read this file (start Streamlit from the repository root).
+
+### Hosted operation (planned, not yet deployed)
+
+There is no public URL yet. If SpecForge is deployed to a website:
+
+- Documents you upload are transmitted to the hosting server and processed there. Upload only synthetic or non-confidential documents. The app shows this notice above the upload controls.
+- The hosting provider's own logging, analytics and privacy policies apply.
+- On Streamlit Community Cloud, the platform sets `gatherUsageStats = true` and overrides the repository setting ([Community Cloud status and limitations](https://docs.streamlit.io/deploy/streamlit-community-cloud/status)). The repository configuration does **not** disable that telemetry.
 
 ## What it checks
 
@@ -26,7 +42,7 @@ python -m pip install -r requirements.txt
 python -m pytest -q
 ```
 
-Dependencies are version ranges, not pins (see [`requirements.txt`](requirements.txt)).
+Direct dependencies are pinned to the versions tested on Python 3.11 and 3.12 (see [`requirements.txt`](requirements.txt); Pint differs by Python version because Pint 0.26 needs Python 3.12). Transitive dependencies are not locked.
 
 ### Web interface
 
@@ -34,7 +50,7 @@ Dependencies are version ranges, not pins (see [`requirements.txt`](requirements
 python -m streamlit run app/ui.py
 ```
 
-Tick **Use the example documents** or upload two `.md`, `.txt`, `.csv` or text-based `.pdf` files.
+Tick **Use an example (synthetic documents) instead of my own files** and choose an example, or upload two `.md`, `.txt`, `.csv` or text-based `.pdf` files.
 
 ### JSON API
 

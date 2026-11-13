@@ -1,4 +1,8 @@
-"""SpecForge: compare measurements in two engineering documents. Runs locally. No network use.
+"""SpecForge: compare measurements in two engineering documents.
+
+The audit engine (app.core) is deterministic and makes no network calls and no AI/API calls. This file is a Streamlit
+app: Streamlit serves it over HTTP, so on a hosted website uploaded documents travel to that server. Streamlit's own
+usage statistics are disabled for local runs in .streamlit/config.toml (a hosting platform may override this).
 
 Start:  .venv/bin/python -m streamlit run app/ui.py
 """
@@ -27,6 +31,9 @@ EXAMPLES = {
     "Pump station: a conflict, two equivalences and four items not compared (examples/pump_station/)":
         (ROOT / "examples" / "pump_station" / "spec.md", ROOT / "examples" / "pump_station" / "purchasing.csv"),
 }
+PRIVACY_NOTICE = ("Privacy: When SpecForge is used on a hosted website, documents you upload are transmitted to the "
+                  "hosting server for processing. Do not upload confidential documents. To process documents on your own "
+                  "machine, run SpecForge locally.")
 VERDICT_WORDS = {
     "CONFLICTS_FOUND": "Conflicts found",
     "NO_CONFLICTS_PARTIAL_COVERAGE": "No conflicts, but incomplete",
@@ -73,6 +80,8 @@ with st.expander("What SpecForge reads, and what it does not", expanded=False):
         "and it does not certify a document."
     )
 
+
+st.info(PRIVACY_NOTICE)
 
 left, right = st.columns(2)
 with left:
