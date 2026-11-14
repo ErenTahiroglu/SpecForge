@@ -45,10 +45,20 @@ normalization (NFKC) SHALL NOT be used, because it changed `m²` to `m2`, circle
 to ASCII. The reported row text is unchanged and nothing is converted.
 R9. (Review finding F4.) The banned-claim check SHALL run on rendered user-visible text as well as on source text, for the
 surfaces that the tests render. It does not prove that no future wording can overclaim.
-R10. (Round three, review findings N1 to N3.) Standing rule: a row that the first commit (c721a6d1) warned about SHALL still be warned,
-and a control that the first commit kept quiet SHALL stay quiet, unless this spec lists the exception and the reason. Listed
-exceptions: none for warnings lost; the first commit's own conservative warnings (`Rev | Date | 2026-11-13`, `pc`, `pcs`, `A`,
-a full-width digit label) are unchanged.
+R10. (Round three, review findings N1 to N3; clarified in the fourth commit, review finding L1.) Standing rule, in two parts.
+(a) A row that the first commit (c721a6d1) warned about, or reported as a conflict, SHALL NOT become a complete, green result.
+(b) A control that the first commit kept quiet SHALL stay quiet, except for the R7 exception below and unless this spec lists another
+exception and its reason. Listed exceptions: none for warnings lost; the first commit's own conservative warnings
+(`Rev | Date | 2026-11-13`, `pc`, `pcs`, `A`, a full-width digit label) are unchanged.
+R10 exception (cross-reference R7). The first commit was quiet for a row that is followed directly by a bare `---` line only because
+it wrongly treated that `---` as a table delimiter row and skipped the row above it; that is the defect R7 removes. From the second
+commit on, such a row is inspected. These three controls, each followed by a bare `---`, therefore produce the same two conservative
+`UNPARSED_ROW` warnings that the first commit already produced for the identical row without the rule:
+1. `| DOC-619 | year | 2028 |`
+2. `| BX-619 | fastener | pc | 12 |`
+3. `Rev | Date | 2026-11-13` (the owner-approved conservative warning; no date exemption)
+These warnings are accepted and documented. The old skip SHALL NOT be restored, and part (a) is not relaxed. Recognition remains a shape
+heuristic: this exception does not claim that these three rows are the only quiet controls that can warn once a bare `---` follows them.
 R11. (Review finding N2.) Heading structure counts UNESCAPED pipes only: `\|` stays inside its cell and `\\|` is an escaped backslash
 followed by a structural pipe. This applies to the table-heading check only; row recognition and row parsing are unchanged.
 
