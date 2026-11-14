@@ -1,2 +1,10 @@
+# Streamlit's own upload limit, "2" megabytes. Measured with Streamlit 1.67.0 in a real browser: the page refuses a file
+# above 2,000,000 bytes (2,000,000 is accepted, 2,000,001 is refused). Streamlit's server-side check uses 2 MiB
+# (2,097,152 bytes) for clients that bypass the page. The application keeps its own exact guard of 2,000,000 bytes
+# (app/ingest.py: MAX_FILE_BYTES), so a file between the two values still gets FILE_TOO_LARGE.
+[server]
+maxUploadSize = 2
+
+# Local runs only. Streamlit Community Cloud forces gatherUsageStats = true and ignores this value.
 [browser]
 gatherUsageStats = false

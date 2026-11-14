@@ -46,7 +46,9 @@ def test_ui_docstring_no_longer_claims_no_network_unconditionally():
 
 def test_local_streamlit_usage_statistics_are_disabled():
     cfg = tomllib.loads((ROOT / ".streamlit" / "config.toml").read_text(encoding="utf-8"))
-    assert cfg == {"browser": {"gatherUsageStats": False}}
+    # Amended 2026-11-14 (ingress hardening): `server.maxUploadSize` was added; the local usage-statistics opt-out is unchanged.
+    assert cfg["browser"] == {"gatherUsageStats": False}
+    assert cfg == {"server": {"maxUploadSize": 2}, "browser": {"gatherUsageStats": False}}
 
 
 def test_direct_dependencies_are_pinned_exactly():
