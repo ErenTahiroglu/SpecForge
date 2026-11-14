@@ -23,23 +23,54 @@ symbol) and an optional unit word, THE SYSTEM SHALL report it as `UNPARSED_ROW` 
 SHALL NOT parse or compare it.
 R2. For comma rows outside `.csv`, the first cell SHALL be an identifier-like token. For a bare number in the fourth cell or
 later, the cell before it SHALL be a unit the engine knows, refuses as ambiguous, or a gauge/absolute pressure spelling.
-R3. A conflict among compared rows SHALL stay authoritative (`CONFLICTS_FOUND`); `coverage_complete` SHALL then be false.
+R3. A conflict among compared rows SHALL stay authoritative (`CONFLICTS_FOUND`). `coverage_complete` SHALL be false WHEN any coverage gap exists, and
+SHALL stay true when a conflict is found and every recognized row was compared.
 R4. A blank line, or a line with neither `|` nor `,`, SHALL NOT reach any regular expression. A line with a delimiter and more
-than `MAX_LINE_CHARS` (2,000) characters SHALL NOT be inspected; it SHALL be reported as `LINE_TOO_LONG` (excerpt at most
-200 characters) and SHALL count as a coverage gap. The 200,000-character and 5,000-line limits are unchanged.
+than `MAX_LINE_CHARS` (2,000) characters SHALL NOT be inspected; it SHALL be reported as `LINE_TOO_LONG` (excerpt: the first 200
+characters plus an optional ellipsis, so at most 201 characters) and SHALL count as a coverage gap. The 200,000-character and 5,000-line limits are unchanged.
 R5. `.streamlit/config.toml` SHALL set `server.maxUploadSize = 2` and keep `browser.gatherUsageStats = false`. The exact
 application guard `MAX_FILE_BYTES = 2_000_000` SHALL stay.
 R6. README, the UI text and the MCP docstring SHALL state: recognizable unsupported measurement-like rows are listed and stay
 un-compared; other unrecognized formats may be missed; no-conflict results apply only to compared rows. They SHALL NOT claim
 that all invalid measurement lines are detected.
 
-## Known limits (locked by tests, stated in the README)
-False positives: `Rev | Date | 2026-11-13`; list rows such as `Item,count,3 pieces`; comma metadata rows in a `.csv` whose
-third cell starts with a digit; delimiter-bearing prose lines over 2,000 characters.
-Missed without warning: description-first comma rows outside `.csv`; a value inside a sentence; two-cell rows; a unit followed
-by extra words; semicolon or tab delimiters; ranges in the fourth cell; a bare number after an unknown unit word.
-Precision and recall of the recognizer have not been measured; the probe sample (46 hand-written lines) is design evidence only.
+R7. (Second round, review finding F1.) A line SHALL be skipped as a table heading only WHEN the next line is pipe-delimited, every
+cell of it is a delimiter cell (`:?-{3,}:?`) and it has the same number of columns as the line. A bare `---` SHALL NOT suppress
+the line above it. A delimiter row longer than 2,000 characters SHALL NOT suppress it either, and is reported as `LINE_TOO_LONG`.
+R8. (Review finding F2.) The unit glyphs `Ω` (U+03A9 and U+2126), `℃` (U+2103) and `℉` (U+2109) SHALL count as unit words for
+recognition only (matching uses Unicode compatibility normalization; the reported row text is unchanged). Nothing is converted.
+R9. (Review finding F4.) The banned-claim check SHALL run on rendered user-visible text as well as on source text, for the
+surfaces that the tests render. It does not prove that no future wording can overclaim.
 
-## Measured while implementing
-Streamlit 1.67.0 in a real browser with `maxUploadSize = 2`: 2,000,000 bytes accepted, 2,000,001 refused (decimal megabytes).
-The server-side check uses 2 MiB. The brief's assumption that the browser limit is 2,097,152 bytes was wrong.
+## Known limits (locked by tests, stated in the README)
+False positives: `Rev | Date | 2026-11-13`; list rows such as `Item,count,3 pieces`; unit-named columns that the unit library accepts
+(`pc`, `pcs`, `A`); comma metadata rows in a `.csv` whose third cell starts with a digit; delimiter-bearing prose lines over
+2,000 characters.
+Missed without warning: description-first comma rows outside `.csv`; a value inside a sentence; two-cell rows; a unit followed
+by extra words; semicolon or tab delimiters; ranges, scientific notation and decimal commas in a late cell; a zero-width space
+inside a qualifier; rows that mix `|` and `,` inside one line; unit glyphs other than the four named in R8 (for example `Å` and `‰`); full-width
+delimiters; a bare number after an unknown unit word. `Nm` in a unit column is
+recognized on Python 3.11 (Pint 0.25.x) and not on 3.12 (Pint 0.26.x); this round does not change that path.
+Precision and recall of the recognizer have not been measured.
+
+## Evidence that is not a rate
+- The author's design sample (46 hand-written lines) is design evidence only.
+- The independent reviewer's 70-case sample (45 measurement-like rows, 25 controls), observed on commit c721a6d1: 44/45 measurement-like
+  cases were false-clean on the base and 16/45 (Python 3.12) or 15/45 (3.11) on the patch; controls that raised a warning rose
+  from 4/25 to 10/25. These are hand-picked adversarial-sample counts, not recall or precision, and not a population estimate.
+  Round two's counts on the same unchanged sample are recorded in the private round-two report.
+- CPU: a serial run of 99 lines of exactly 2,000 characters took 1.916 s on the reviewer's hardware. Matching is bounded by the
+  line limit; it is not linear time for every supported line.
+
+## Interface changes introduced by this work (documented, not hidden)
+New warning code `LINE_TOO_LONG` (fields `length`, `limit`, `excerpt`, `reason`); new key `coverage[document]["rows_too_long"]`
+(a zero is present for every document); a third `UNPARSED_ROW.reason` text for comma rows outside `.csv`; new constant
+`MAX_LINE_CHARS = 2000`. Clients that compare the whole coverage object for equality need updating.
+
+## Input limits, stated at the strength the evidence supports
+- Observed once, Brave on macOS, Streamlit 1.67.0, `maxUploadSize = 2`: a file of 2,000,000 bytes was accepted and 2,000,001 bytes was refused by the page.
+- The installed Streamlit frontend chooses its megabyte base from a platform predicate; an offline run of its own functions gave
+  2,097,152 bytes for a Windows platform string and 2,000,000 for macOS or Linux. A real Windows browser run was not verified.
+- Streamlit's server-side check uses 2 MiB plus multipart framing; Community Cloud behaviour is unknown.
+- The application guard for uploaded files is `MAX_FILE_BYTES = 2_000_000` (`FILE_TOO_LARGE`). `POST /audit` is a different path: it takes JSON
+  text and stops at the 200,000-character / 5,000-line core guard with HTTP 422; it never uses `FILE_TOO_LARGE`.

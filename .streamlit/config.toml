@@ -1,7 +1,8 @@
-# Streamlit's own upload limit, "2" megabytes. Measured with Streamlit 1.67.0 in a real browser: the page refuses a file
-# above 2,000,000 bytes (2,000,000 is accepted, 2,000,001 is refused). Streamlit's server-side check uses 2 MiB
-# (2,097,152 bytes) for clients that bypass the page. The application keeps its own exact guard of 2,000,000 bytes
-# (app/ingest.py: MAX_FILE_BYTES), so a file between the two values still gets FILE_TOO_LARGE.
+# Streamlit's own upload limit, "2" megabytes. Observed once: Brave on macOS with Streamlit 1.67.0 refused a file of 2,000,001
+# bytes and accepted 2,000,000 bytes. That is not a statement about every browser: the installed frontend picks its megabyte
+# base from the platform (offline: 2,097,152 bytes for a Windows platform string), and a real Windows browser run was not
+# verified. Streamlit's server-side check uses 2 MiB plus multipart framing. The application keeps its own exact guard of
+# 2,000,000 bytes for uploaded files (app/ingest.py: MAX_FILE_BYTES, error code FILE_TOO_LARGE).
 [server]
 maxUploadSize = 2
 

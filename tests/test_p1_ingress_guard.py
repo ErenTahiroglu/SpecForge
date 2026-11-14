@@ -41,7 +41,7 @@ class _Boom:
 
 
 def test_blank_and_delimiter_free_lines_never_reach_a_regular_expression(monkeypatch):
-    for attr in ("ENTRY", "CSV_ENTRY", "_TABLE_SEPARATOR"):
+    for attr in ("ENTRY", "CSV_ENTRY", "_SEPARATOR_CELL"):
         monkeypatch.setattr(core, attr, _Boom())
     text = "\n".join([" " * 60_000, "\t \t", "x" * 80_000, "plain prose without any delimiter " * 400, ""])
     records, warnings, cov = core._parse("a.md", text)

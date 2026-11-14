@@ -6,4 +6,7 @@
 - [x] T3 GREEN: `_looks_like_unsupported_layout` and the per-line guard in `app/core.py`; `LINE_TOO_LONG` in `app/report.py`.
 - [x] T4 Config and copy: `.streamlit/config.toml`, README, UI text, MCP docstring.
 - [x] T5 Local real-browser smoke (upload boundaries, hidden row, pump station, over-long line).
-- [ ] T6 Independent adversarial review (not self-approved). Owner checkpoint before any push, PR, merge or deployment.
+- [x] T6 Independent adversarial review of commit c721a6d1 (Codex, read-only): BLOCK (F1 HIGH, F2 MEDIUM, F3 and F4 LOW).
+- [x] T7 Round two, written test-first: F1 structural table-heading check; F2 recognition-only unit glyphs; F3 input-limit wording and the
+      API/upload distinction; F4 rendered-copy check with a split-literal mutation; spec corrections (R3, R4, R7 to R9).
+- [ ] T8 Second independent review (not self-approved). Owner checkpoint before any push, PR, merge or deployment.

@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass
 import functools
 import math
 import re
+import unicodedata
 from typing import Mapping
 import pint
 
@@ -112,6 +113,26 @@ def dimension_key(dimensionality) -> str:
                     for name, power in items) or "dimensionless"
 
 
+def _pipe_cells(line: str) -> list:
+    """Cells of a pipe-delimited line, without the optional outer pipes."""
+    body = line.strip()
+    body = body[1:] if body.startswith("|") else body
+    body = body[:-1] if body.endswith("|") else body
+    return body.split("|")
+
+
+def _is_table_heading(line: str, next_line: str) -> bool:
+    """D06: the line above a Markdown table delimiter row is the table heading, never a measurement row.
+
+    The next line must itself be pipe-delimited, every one of its cells must be a delimiter cell, and it must have the same
+    number of columns as this line. A bare `---` (a Markdown horizontal rule or a setext underline) therefore never hides
+    the line above it (issue #12 review finding F1). Linear time: no regular expression runs on the whole line."""
+    if "|" not in next_line or "---" not in next_line or len(next_line) > MAX_LINE_CHARS or line.count("|") < 2:
+        return False
+    delimiter = _pipe_cells(next_line)
+    return all(_SEPARATOR_CELL.fullmatch(cell.strip()) for cell in delimiter) and len(delimiter) == len(_pipe_cells(line))
+
+
 def split_lines(text: str) -> list[str]:
     """Split on editor line breaks. A final line break does not create an extra line."""
     parts = _LINE_BREAK.split(text)
@@ -125,7 +146,8 @@ def _is_csv(name: str) -> bool:
 
 
 _NUMBER_START = re.compile(r"^\s*(?:approx\.?|about|ca\.?|[~≈<>≤≥±+\-−=])*\s*[.,]?\d")
-_TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
+# One cell of a Markdown table delimiter row: three or more dashes, optional alignment colons (`---`, `:---`, `---:`, `:---:`).
+_SEPARATOR_CELL = re.compile(r":?-{3,}:?")
 
 
 # Quote characters (ASCII/typographic). Quoting is NOT part of the supported row grammar: a row that uses it is
@@ -170,22 +192,24 @@ def _looks_like_three_cell_row(raw: str, csv_file: bool) -> bool:
 # followed by one unit-like word: `10`, `10 bar`, `max 10 bar`, `~10 bar`, `0.5 m^3/s`. A cell such as `10 bar design` or
 # `value is 10 bar` is NOT one (see the known-undetected tests). A tag is not required to contain a digit: PUMP is legal.
 _QUALIFIER = r"(?:(?:max|min|nom|nominal|typ|typical|approx|approximately|about|ca)\.?\s*|[~≈<>≤≥±+\-−=]\s*)*"
-_MEASURE_CELL = re.compile(_QUALIFIER + r"(?:\d+(?:\.\d+)?|\.\d+)\s*(?:[A-Za-z°µμ%][\w°µμ/%^.*-]*)?", re.IGNORECASE)
+_MEASURE_CELL = re.compile(_QUALIFIER + r"(?:\d+(?:\.\d+)?|\.\d+)\s*(?:[A-Za-z°µμΩ%][\w°µμΩ/%^.*-]*)?", re.IGNORECASE)
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][\w.-]{0,31}")
 
 
 _NUMBER_ONLY = re.compile(_QUALIFIER + r"(?:\d+(?:\.\d+)?|\.\d+)", re.IGNORECASE)
-_UNIT_TOKEN = re.compile(r"[A-Za-z°µμ%][\w°µμ/%^.*-]{0,23}")
+_UNIT_TOKEN = re.compile(r"[A-Za-z°µμΩ%][\w°µμΩ/%^.*-]{0,23}")
 # Gauge/absolute pressure spellings are not supported units (README), but a column that holds them is still a unit column.
 _PRESSURE_BASIS_UNIT = re.compile(r"(?:mbar|bar|psi|kpa|mpa|pa)[ga]", re.IGNORECASE)
 
 
 @functools.lru_cache(maxsize=512)
 def _unit_like(cell: str) -> bool:
-    """True when a whole cell is a unit the engine knows, refuses as ambiguous, or a gauge/absolute pressure spelling."""
+    """True when a whole cell is a unit the engine knows, refuses as ambiguous, a gauge/absolute pressure spelling, or an
+    engineering unit glyph (ohm sign, omega, degree-Celsius and degree-Fahrenheit signs; recognition only, never converted)."""
+    cell = unicodedata.normalize("NFKC", cell)
     if not _UNIT_TOKEN.fullmatch(cell):
         return False
-    if _PRESSURE_BASIS_UNIT.fullmatch(cell) or ambiguous_unit(cell):
+    if cell == "\u03a9" or _PRESSURE_BASIS_UNIT.fullmatch(cell) or ambiguous_unit(cell):
         return True
     try:
         UNITS.Quantity(1, ALIASES.get(cell, cell))
@@ -201,6 +225,9 @@ def _has_measurement_cell(cells: list, first_cell=None) -> bool:
     rule, quantity, page and year columns of ordinary tables (`| P-101 | Pump | Grundfos | 2 |`) would be reported."""
     if len(cells) < 3:
         return False
+    # Compatibility normalization for MATCHING only: U+2103 and U+2109 become `°C` and `°F`, the ohm sign U+2126 becomes the
+    # Greek omega, full-width digits and letters become ASCII. The row text that is reported is never changed.
+    cells = [unicodedata.normalize("NFKC", cell) for cell in cells]
     if first_cell is not None and not first_cell.fullmatch(cells[0]):
         return False
     for index in range(2, len(cells)):
@@ -297,9 +324,8 @@ def _parse(name: str, text: str):
                              "reason": f"the line is longer than {MAX_LINE_CHARS:,} characters; it was not read and not compared"})
             continue
         next_line = lines[line_number] if line_number < len(lines) else ""
-        if ("---" in next_line and raw.count("|") >= 2 and len(next_line) <= MAX_LINE_CHARS
-                and _TABLE_SEPARATOR.match(next_line)):
-            continue                       # D06: the line above a Markdown table separator is the table heading, never a row
+        if _is_table_heading(raw, next_line):
+            continue                       # D06: the line above a genuine pipe-delimited table delimiter row is the heading, never a row
         match = ENTRY.fullmatch(raw) or (CSV_ENTRY.fullmatch(raw) if csv_file else None)
         if not match:
             if _looks_like_row(raw, csv_file):
