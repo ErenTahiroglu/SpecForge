@@ -220,6 +220,9 @@ def _coverage_items(result: dict) -> tuple:
             gaps.append(CoverageItem(code, f"{w['message']} ({a['tag']} {a['field']}: {a['unit']} vs {b['unit']})",
                                      f"{describe_location(a['document'], a['line'])} / {describe_location(b['document'], b['line'])}",
                                      a["excerpt"] + "\n" + b["excerpt"]))
+        elif code == "LINE_TOO_LONG":
+            gaps.append(CoverageItem(code, f"The line has {w['length']} characters. Lines over {w['limit']} characters are not read, so this row was not compared.",
+                                     f"{w['document']}, {describe_location(w['document'], w['line'])}", w["excerpt"]))
         else:
             gaps.append(CoverageItem(code, REASONS.get(code, code), f"{w['document']}, {describe_location(w['document'], w['line'])}", w["excerpt"]))
     for u in result["unmatched"]:

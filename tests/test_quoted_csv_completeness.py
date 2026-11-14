@@ -132,8 +132,17 @@ def test_quoted_value_in_a_pipe_row_is_reported_too():
 
 
 def test_csv_grammar_still_applies_only_to_csv_named_documents():
+    """REVISED 2026-11-14 (issue #12, owner-decided recognition-vs-parsing split).
+
+    Before: a bare comma row in .txt was ignored silently (`unparsed(r) == []`). That let a hidden disagreement vanish
+    behind a clean verdict when the same input was sent through the MCP tool, which has no file names.
+    Now: CSV PARSING is still gated on a `.csv` file name (nothing is parsed or compared here), but a clearly
+    measurement-like comma row outside .csv is RECOGNIZED and reported as UNPARSED_ROW, so coverage is incomplete.
+    Still true: comparisons == 0 and no record is created from the row."""
     r = audit_documents({"a.txt": GOOD, "b.txt": GOOD})
-    assert r["comparisons"] == 0 and unparsed(r) == []             # unchanged: bare CSV in .txt is not a row (no quotes involved)
+    assert r["comparisons"] == 0 and r["records"] == 0               # still not parsed, still not compared
+    assert [(w["document"], w["line"], w["excerpt"]) for w in unparsed(r)] == [("a.txt", 1, GOOD), ("b.txt", 1, GOOD)]
+    assert r["verdict"] == "NOTHING_COMPARED" and r["coverage_complete"] is False
 
 
 # ---------- propagation to every surface

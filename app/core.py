@@ -6,14 +6,16 @@ Accepted rows (exact format only, no free-form inference):
   TAG,property,number,unit              (files named *.csv only)
 
 Quoted fields are not part of the grammar: a measurement-like row that uses them is not compared and is
-reported as UNPARSED_ROW.
-Everything the checker cannot use is reported (UNSUPPORTED_UNIT, UNPARSED_ROW,
-DUPLICATE_IDENTIFIER, DIMENSION_MISMATCH, unmatched records), so a clean status is never
-claimed for input that was only partly understood.
+reported as UNPARSED_ROW. The same holds for other recognizable unsupported layouts (four-cell tables, `max 10 bar`, comma
+rows outside .csv): recognized and listed, never parsed or compared. A line over MAX_LINE_CHARS is reported as LINE_TOO_LONG.
+Everything the checker recognizes but cannot use is reported (UNSUPPORTED_UNIT, UNPARSED_ROW,
+DUPLICATE_IDENTIFIER, DIMENSION_MISMATCH, unmatched records), so a clean status is not claimed for rows it recognized
+but could not compare. Rows in layouts it cannot recognize may be missed (see README, "What is recognized").
 """
 from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict, dataclass
+import functools
 import math
 import re
 from typing import Mapping
@@ -68,6 +70,13 @@ _ABSOLUTE_WORDS = {"temperature", "temp"}
 _OFFSET_TO_DELTA = {"degree_Celsius": "delta_degC", "degree_Fahrenheit": "delta_degF"}
 MAX_CHARS = 200_000
 MAX_LINES = 5_000
+# Ingress guard (public hosting). The row regular expressions below are not linear-time on long runs of whitespace
+# (measured on the frozen baseline: one line of ~100,000 spaces took ~42 s, growth ~quadratic). Blank and delimiter-free
+# lines therefore skip every regular expression, and a delimiter-bearing line longer than this is not inspected: it is
+# reported as LINE_TOO_LONG (a visible coverage gap), never dropped. Real engineering rows are far shorter; the limit is
+# applied per line, so the worst case for one document stays bounded (about MAX_CHARS * MAX_LINE_CHARS steps).
+MAX_LINE_CHARS = 2_000
+_EXCERPT_CHARS = 200
 SCOPE = "Structured rows only; not a general PDF/P&ID semantic audit"
 
 
@@ -103,6 +112,47 @@ def dimension_key(dimensionality) -> str:
                     for name, power in items) or "dimensionless"
 
 
+def _split_unescaped_pipes(text: str) -> list:
+    """Split on pipes that are not escaped. `\\|` is an escaped pipe (part of the cell); `\\\\|` is an escaped backslash followed
+    by a real pipe. Linear time; used only for the table-heading check."""
+    cells, start, backslashes = [], 0, 0
+    for index, char in enumerate(text):
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == "|" and backslashes % 2 == 0:
+            cells.append(text[start:index])
+            start = index + 1
+        backslashes = 0
+    cells.append(text[start:])
+    return cells
+
+
+def _pipe_cells(line: str) -> list:
+    """Cells of a pipe-delimited line for the heading check: optional outer pipes removed, escaped pipes kept inside their cell."""
+    body = line.strip()
+    body = body[1:] if body.startswith("|") else body
+    before = body[:-1]
+    if body.endswith("|") and (len(before) - len(before.rstrip("\\"))) % 2 == 0:      # a trailing pipe preceded by an escape is not a closing pipe
+        body = before
+    return _split_unescaped_pipes(body)
+
+
+def _is_table_heading(line: str, next_line: str) -> bool:
+    """D06: the line above a Markdown table delimiter row is the table heading, never a measurement row.
+
+    The next line must itself be pipe-delimited, every one of its cells must be a delimiter cell, and it must have the same
+    number of columns as this line. Only UNESCAPED pipes are structural, so `| Tag | Date | 2027 \\| issue |` has three columns
+    (review finding N2). A bare `---` (a Markdown horizontal rule or a setext underline) never hides the line above it
+    (review finding F1). Linear time: no regular expression runs on the whole line."""
+    if "|" not in next_line or "---" not in next_line or len(next_line) > MAX_LINE_CHARS:
+        return False
+    if len(_split_unescaped_pipes(line)) - 1 < 2:
+        return False
+    delimiter = _pipe_cells(next_line)
+    return all(_SEPARATOR_CELL.fullmatch(cell.strip()) for cell in delimiter) and len(delimiter) == len(_pipe_cells(line))
+
+
 def split_lines(text: str) -> list[str]:
     """Split on editor line breaks. A final line break does not create an extra line."""
     parts = _LINE_BREAK.split(text)
@@ -116,7 +166,8 @@ def _is_csv(name: str) -> bool:
 
 
 _NUMBER_START = re.compile(r"^\s*(?:approx\.?|about|ca\.?|[~≈<>≤≥±+\-−=])*\s*[.,]?\d")
-_TABLE_SEPARATOR = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
+# One cell of a Markdown table delimiter row: three or more dashes, optional alignment colons (`---`, `:---`, `---:`, `:---:`).
+_SEPARATOR_CELL = re.compile(r":?-{3,}:?")
 
 
 # Quote characters (ASCII/typographic). Quoting is NOT part of the supported row grammar: a row that uses it is
@@ -130,7 +181,7 @@ def _unquote(cell: str) -> str:
     return cell.strip().strip(_QUOTE_CHARS).strip()
 
 
-def _looks_like_row(raw: str, csv_file: bool) -> bool:
+def _looks_like_three_cell_row(raw: str, csv_file: bool) -> bool:
     """A line with 3+ cells whose third cell STARTS like a number, but which no row pattern accepted.
 
     A heading such as `value (2026 rev)` holds a digit but does not start with one, so it is not a measurement.
@@ -154,6 +205,95 @@ def _looks_like_row(raw: str, csv_file: bool) -> bool:
     flat = [_unquote(c) for c in _DOUBLE_QUOTES.sub("", raw).split(",")]
     return (len(flat) >= 3 and bool(_TAG_LIKE.fullmatch(flat[0]))
             and any(_NUMBER_START.match(c) for c in flat[2:]))
+
+
+# --- Issue #12: recognition of UNSUPPORTED measurement-like layouts (recognition only; nothing here is parsed or compared) ---
+# A "measurement cell" is a whole cell holding a number, optionally led by a qualifier word or symbol and optionally
+# followed by one unit-like word: `10`, `10 bar`, `max 10 bar`, `~10 bar`, `0.5 m^3/s`. A cell such as `10 bar design` or
+# `value is 10 bar` is NOT one (see the known-undetected tests). A tag is not required to contain a digit: PUMP is legal.
+_QUALIFIER = r"(?:(?:max|min|nom|nominal|typ|typical|approx|approximately|about|ca)\.?\s*|[~≈<>≤≥±+\-−=]\s*)*"
+_MEASURE_CELL = re.compile(_QUALIFIER + r"(?:\d+(?:\.\d+)?|\.\d+)\s*(?:[A-Za-z°µμΩ%][\w°µμΩ/%^.*-]*)?", re.IGNORECASE)
+_IDENTIFIER = re.compile(r"[A-Za-z0-9][\w.-]{0,31}")
+
+
+_NUMBER_ONLY = re.compile(_QUALIFIER + r"(?:\d+(?:\.\d+)?|\.\d+)", re.IGNORECASE)
+_UNIT_TOKEN = re.compile(r"[A-Za-z°µμΩ%][\w°µμΩ/%^.*-]{0,23}")
+# Gauge/absolute pressure spellings are not supported units (README), but a column that holds them is still a unit column.
+_PRESSURE_BASIS_UNIT = re.compile(r"(?:mbar|bar|psi|kpa|mpa|pa)[ga]", re.IGNORECASE)
+
+
+# Recognition-only glyph mapping, the ONLY compatibility mapping in this module: U+2103 (degree-Celsius sign) -> `°C`, U+2109
+# (degree-Fahrenheit sign) -> `°F`, U+2126 (ohm sign) -> U+03A9 (Greek omega). It is ADDITIVE: the raw cell is always tried first, so
+# everything the first commit recognized is recognized unchanged, and nothing else (superscripts, circled or roman labels, full-width
+# or compatibility letters) is rewritten. The reported row text is never changed and nothing is parsed or converted.
+_GLYPH_MAP = str.maketrans({"\u2103": "\u00b0C", "\u2109": "\u00b0F", "\u2126": "\u03a9"})
+
+
+def _unit_like_raw(cell: str) -> bool:
+    """True when the RAW cell is a unit the engine knows, refuses as ambiguous, a gauge/absolute pressure spelling, or the omega sign."""
+    if not _UNIT_TOKEN.fullmatch(cell):
+        return False
+    if cell == "\u03a9" or _PRESSURE_BASIS_UNIT.fullmatch(cell) or ambiguous_unit(cell):
+        return True
+    try:
+        UNITS.Quantity(1, ALIASES.get(cell, cell))
+        return True
+    except Exception:  # unknown unit word: not a unit column
+        return False
+
+
+@functools.lru_cache(maxsize=512)
+def _unit_like(cell: str) -> bool:
+    """Is this whole cell a unit column? Raw cell first (as in the first commit), then the three-glyph mapping as an additive fallback."""
+    if _unit_like_raw(cell):
+        return True
+    mapped = cell.translate(_GLYPH_MAP)
+    return mapped != cell and _unit_like_raw(mapped)
+
+
+def _has_measurement_cell(cells: list, first_cell=None) -> bool:
+    """3+ cells and a measurement cell somewhere from the third cell on. `first_cell` optionally constrains cell 1.
+
+    A BARE number (no unit word) in the fourth cell or later counts only when the cell before it is a unit. Without that
+    rule, quantity, page and year columns of ordinary tables (`| P-101 | Pump | Grundfos | 2 |`) would be reported."""
+    if len(cells) < 3:
+        return False
+    if first_cell is not None and not first_cell.fullmatch(cells[0]):
+        return False
+    for index in range(2, len(cells)):
+        cell = cells[index]
+        mapped = cell.translate(_GLYPH_MAP)            # additive: the raw cell is tried first
+        if not (_MEASURE_CELL.fullmatch(cell) or (mapped != cell and _MEASURE_CELL.fullmatch(mapped))):
+            continue
+        if index >= 3 and _NUMBER_ONLY.fullmatch(cell) and not _unit_like(cells[index - 1]):
+            continue
+        return True
+    return False
+
+
+def _looks_like_unsupported_layout(raw: str, csv_file: bool) -> bool:
+    """Four-cell tables, `max 10 bar`, quoted pipe rows in a .csv, comma rows outside .csv (txt, md, MCP).
+
+    Pipe rows: no constraint on the first cell (the baseline three-cell rule has none either).
+    Comma rows: in a .csv file no constraint (comma rows are that file type's own layout); elsewhere the first cell must
+    be a bare identifier, so prose such as `Note: pumps, valves, and 3 spares` or `Prepared by Acme, Ltd, 2026` stays quiet.
+    This is a shape heuristic. Its precision and recall have NOT been measured."""
+    text = raw.strip()
+    if "|" in text:
+        body = text[1:] if text.startswith("|") else text
+        body = body[:-1] if body.endswith("|") else body
+        if _has_measurement_cell([_unquote(c) for c in body.split("|")]):
+            return True
+    if "," in text:
+        cells = [_unquote(c) for c in _DOUBLE_QUOTES.sub("", text).split(",")]
+        if _has_measurement_cell(cells, None if csv_file else _IDENTIFIER):
+            return True
+    return False
+
+
+def _looks_like_row(raw: str, csv_file: bool) -> bool:
+    """True when a line that no supported pattern accepted is still recognizably a measurement row. Never parses it."""
+    return _looks_like_three_cell_row(raw, csv_file) or _looks_like_unsupported_layout(raw, csv_file)
 
 
 def ambiguous_unit(unit: str):
@@ -199,18 +339,33 @@ def _parse(name: str, text: str):
     csv_file = _is_csv(name)
     records: list[Observation] = []
     warnings: list[dict] = []
-    coverage = {"lines": len(lines), "rows_parsed": 0, "rows_unsupported_unit": 0, "rows_ambiguous_unit": 0, "rows_unparsed": 0}
+    coverage = {"lines": len(lines), "rows_parsed": 0, "rows_unsupported_unit": 0, "rows_ambiguous_unit": 0, "rows_unparsed": 0,
+                "rows_too_long": 0}
     for line_number, raw in enumerate(lines, 1):
+        if not raw.strip():
+            continue                       # ingress: a blank line is never a row (linear time, no regular expression)
+        if "|" not in raw and "," not in raw:
+            continue                       # ingress: ENTRY needs a pipe and CSV_ENTRY a comma, so this cannot be a row
+        if len(raw) > MAX_LINE_CHARS:
+            text = raw.strip()
+            coverage["rows_too_long"] += 1
+            warnings.append({"code": "LINE_TOO_LONG", "document": name, "line": line_number,
+                             "excerpt": text[:_EXCERPT_CHARS] + ("\u2026" if len(text) > _EXCERPT_CHARS else ""),
+                             "length": len(raw), "limit": MAX_LINE_CHARS,
+                             "reason": f"the line is longer than {MAX_LINE_CHARS:,} characters; it was not read and not compared"})
+            continue
         next_line = lines[line_number] if line_number < len(lines) else ""
-        if _TABLE_SEPARATOR.match(next_line) and raw.count("|") >= 2:
-            continue                       # D06: the line above a Markdown table separator is the table heading, never a row
+        if _is_table_heading(raw, next_line):
+            continue                       # D06: the line above a genuine pipe-delimited table delimiter row is the heading, never a row
         match = ENTRY.fullmatch(raw) or (CSV_ENTRY.fullmatch(raw) if csv_file else None)
         if not match:
             if _looks_like_row(raw, csv_file):
                 coverage["rows_unparsed"] += 1
                 quoted = any(q in raw for q in _QUOTE_CHARS)
+                comma_outside_csv = not csv_file and "," in raw and "|" not in raw
                 warnings.append({"code": "UNPARSED_ROW", "document": name, "line": line_number, "excerpt": raw.strip(),
                                  "reason": ("row uses quoted fields, which are not supported; it was not compared" if quoted
+                                            else "comma-separated rows are read only from .csv files; it was not compared" if comma_outside_csv
                                             else "row does not match the supported format")})
             continue
         tag, field = match["tag"], match["field"].strip()
