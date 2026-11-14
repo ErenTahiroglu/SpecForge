@@ -4,11 +4,15 @@
    length (measured locally; NOT an observed Cloud outage). Fix: a linear-time fast path for blank and delimiter-free
    lines, and a per-line limit (MAX_LINE_CHARS) before any regular expression runs on a delimiter-bearing line.
    A line over the limit is never dropped silently: it becomes a visible LINE_TOO_LONG coverage gap.
-2. Upload limit. Streamlit's own limit (server.maxUploadSize = 2) sits at the application's exact guard
-   (MAX_FILE_BYTES = 2,000,000 bytes). Measured in a real browser with Streamlit 1.67.0: the page refuses files above
-   2,000,000 bytes. Streamlit's SERVER-side check is 2 MiB = 2,097,152 bytes, so the numbers differ for clients that bypass
-   the page and the application guard stays as defence in depth. The browser behaviour is checked by the local browser smoke,
-   not by these unit tests."""
+2. Upload limit. `server.maxUploadSize = 2` is set in .streamlit/config.toml and the application keeps its own exact guard
+   (MAX_FILE_BYTES = 2,000,000 bytes). What was OBSERVED: one browser, Brave on macOS with Streamlit 1.67.0, refused a file of
+   2,000,001 bytes and accepted 2,000,000 bytes. That is not a statement about every browser: the installed frontend chooses its
+   megabyte base from the platform (an offline run of its own functions gave 2,097,152 bytes for a Win32 platform string and
+   2,000,000 for macOS and Linux); a real Windows browser run was not verified. Streamlit's SERVER-side check uses 2 MiB =
+   2,097,152 bytes plus multipart framing, and Community Cloud behaviour is unknown. The application guard is defence in depth
+   for uploaded files. `POST /audit` is a different path: it takes JSON text and stops at the core 200,000-character /
+   5,000-line guard with HTTP 422; it never calls uploaded-file ingestion and never returns FILE_TOO_LARGE. The browser
+   behaviour is checked by a local browser smoke, not by these unit tests."""
 import time
 import tomllib
 from pathlib import Path
@@ -157,7 +161,8 @@ def test_threshold_paths_in_the_application_guard():
     assert [i["code"] for i in over.issues] == ["FILE_TOO_LARGE"] and over.documents == {}
     exactly = ingest_upload("big.md", b"a" * 2_000_000)
     assert not any(i["code"] == "FILE_TOO_LARGE" for i in exactly.issues)
-    # In a browser, Streamlit refuses anything above 2,000,000 bytes before ingest_upload can run (measured; see the
-    # docstring), so FILE_TOO_LARGE is reached only by direct uploads between 2,000,001 and 2,097,152 bytes and by the API.
+    # What the browser does between 2,000,001 and 2,097,152 bytes depends on the browser and platform (see the module docstring;
+    # only Brave on macOS was observed). Whatever the page lets through, ingest_upload (uploaded files) answers FILE_TOO_LARGE
+    # here. POST /audit is not this path: it returns HTTP 422 at the 200,000-character core guard.
     between = ingest_upload("big.md", b"a" * 2_050_000)
     assert [i["code"] for i in between.issues] == ["FILE_TOO_LARGE"]

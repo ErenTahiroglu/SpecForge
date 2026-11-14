@@ -18,7 +18,6 @@ from dataclasses import asdict, dataclass
 import functools
 import math
 import re
-import unicodedata
 from typing import Mapping
 import pint
 
@@ -113,21 +112,42 @@ def dimension_key(dimensionality) -> str:
                     for name, power in items) or "dimensionless"
 
 
+def _split_unescaped_pipes(text: str) -> list:
+    """Split on pipes that are not escaped. `\\|` is an escaped pipe (part of the cell); `\\\\|` is an escaped backslash followed
+    by a real pipe. Linear time; used only for the table-heading check."""
+    cells, start, backslashes = [], 0, 0
+    for index, char in enumerate(text):
+        if char == "\\":
+            backslashes += 1
+            continue
+        if char == "|" and backslashes % 2 == 0:
+            cells.append(text[start:index])
+            start = index + 1
+        backslashes = 0
+    cells.append(text[start:])
+    return cells
+
+
 def _pipe_cells(line: str) -> list:
-    """Cells of a pipe-delimited line, without the optional outer pipes."""
+    """Cells of a pipe-delimited line for the heading check: optional outer pipes removed, escaped pipes kept inside their cell."""
     body = line.strip()
     body = body[1:] if body.startswith("|") else body
-    body = body[:-1] if body.endswith("|") else body
-    return body.split("|")
+    before = body[:-1]
+    if body.endswith("|") and (len(before) - len(before.rstrip("\\"))) % 2 == 0:      # a trailing pipe preceded by an escape is not a closing pipe
+        body = before
+    return _split_unescaped_pipes(body)
 
 
 def _is_table_heading(line: str, next_line: str) -> bool:
     """D06: the line above a Markdown table delimiter row is the table heading, never a measurement row.
 
     The next line must itself be pipe-delimited, every one of its cells must be a delimiter cell, and it must have the same
-    number of columns as this line. A bare `---` (a Markdown horizontal rule or a setext underline) therefore never hides
-    the line above it (issue #12 review finding F1). Linear time: no regular expression runs on the whole line."""
-    if "|" not in next_line or "---" not in next_line or len(next_line) > MAX_LINE_CHARS or line.count("|") < 2:
+    number of columns as this line. Only UNESCAPED pipes are structural, so `| Tag | Date | 2027 \\| issue |` has three columns
+    (review finding N2). A bare `---` (a Markdown horizontal rule or a setext underline) never hides the line above it
+    (review finding F1). Linear time: no regular expression runs on the whole line."""
+    if "|" not in next_line or "---" not in next_line or len(next_line) > MAX_LINE_CHARS:
+        return False
+    if len(_split_unescaped_pipes(line)) - 1 < 2:
         return False
     delimiter = _pipe_cells(next_line)
     return all(_SEPARATOR_CELL.fullmatch(cell.strip()) for cell in delimiter) and len(delimiter) == len(_pipe_cells(line))
@@ -202,11 +222,15 @@ _UNIT_TOKEN = re.compile(r"[A-Za-z°µμΩ%][\w°µμΩ/%^.*-]{0,23}")
 _PRESSURE_BASIS_UNIT = re.compile(r"(?:mbar|bar|psi|kpa|mpa|pa)[ga]", re.IGNORECASE)
 
 
-@functools.lru_cache(maxsize=512)
-def _unit_like(cell: str) -> bool:
-    """True when a whole cell is a unit the engine knows, refuses as ambiguous, a gauge/absolute pressure spelling, or an
-    engineering unit glyph (ohm sign, omega, degree-Celsius and degree-Fahrenheit signs; recognition only, never converted)."""
-    cell = unicodedata.normalize("NFKC", cell)
+# Recognition-only glyph mapping, the ONLY compatibility mapping in this module: U+2103 (degree-Celsius sign) -> `°C`, U+2109
+# (degree-Fahrenheit sign) -> `°F`, U+2126 (ohm sign) -> U+03A9 (Greek omega). It is ADDITIVE: the raw cell is always tried first, so
+# everything the first commit recognized is recognized unchanged, and nothing else (superscripts, circled or roman labels, full-width
+# or compatibility letters) is rewritten. The reported row text is never changed and nothing is parsed or converted.
+_GLYPH_MAP = str.maketrans({"\u2103": "\u00b0C", "\u2109": "\u00b0F", "\u2126": "\u03a9"})
+
+
+def _unit_like_raw(cell: str) -> bool:
+    """True when the RAW cell is a unit the engine knows, refuses as ambiguous, a gauge/absolute pressure spelling, or the omega sign."""
     if not _UNIT_TOKEN.fullmatch(cell):
         return False
     if cell == "\u03a9" or _PRESSURE_BASIS_UNIT.fullmatch(cell) or ambiguous_unit(cell):
@@ -218,6 +242,15 @@ def _unit_like(cell: str) -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=512)
+def _unit_like(cell: str) -> bool:
+    """Is this whole cell a unit column? Raw cell first (as in the first commit), then the three-glyph mapping as an additive fallback."""
+    if _unit_like_raw(cell):
+        return True
+    mapped = cell.translate(_GLYPH_MAP)
+    return mapped != cell and _unit_like_raw(mapped)
+
+
 def _has_measurement_cell(cells: list, first_cell=None) -> bool:
     """3+ cells and a measurement cell somewhere from the third cell on. `first_cell` optionally constrains cell 1.
 
@@ -225,14 +258,12 @@ def _has_measurement_cell(cells: list, first_cell=None) -> bool:
     rule, quantity, page and year columns of ordinary tables (`| P-101 | Pump | Grundfos | 2 |`) would be reported."""
     if len(cells) < 3:
         return False
-    # Compatibility normalization for MATCHING only: U+2103 and U+2109 become `°C` and `°F`, the ohm sign U+2126 becomes the
-    # Greek omega, full-width digits and letters become ASCII. The row text that is reported is never changed.
-    cells = [unicodedata.normalize("NFKC", cell) for cell in cells]
     if first_cell is not None and not first_cell.fullmatch(cells[0]):
         return False
     for index in range(2, len(cells)):
         cell = cells[index]
-        if not _MEASURE_CELL.fullmatch(cell):
+        mapped = cell.translate(_GLYPH_MAP)            # additive: the raw cell is tried first
+        if not (_MEASURE_CELL.fullmatch(cell) or (mapped != cell and _MEASURE_CELL.fullmatch(mapped))):
             continue
         if index >= 3 and _NUMBER_ONLY.fullmatch(cell) and not _unit_like(cells[index - 1]):
             continue

@@ -27,7 +27,8 @@ R3. A conflict among compared rows SHALL stay authoritative (`CONFLICTS_FOUND`).
 SHALL stay true when a conflict is found and every recognized row was compared.
 R4. A blank line, or a line with neither `|` nor `,`, SHALL NOT reach any regular expression. A line with a delimiter and more
 than `MAX_LINE_CHARS` (2,000) characters SHALL NOT be inspected; it SHALL be reported as `LINE_TOO_LONG` (excerpt: the first 200
-characters plus an optional ellipsis, so at most 201 characters) and SHALL count as a coverage gap. The 200,000-character and 5,000-line limits are unchanged.
+characters of raw.strip() plus an optional ellipsis, so at most 201 characters; `length` is the raw line's character count) and SHALL
+count as a coverage gap. The 200,000-character and 5,000-line limits are unchanged.
 R5. `.streamlit/config.toml` SHALL set `server.maxUploadSize = 2` and keep `browser.gatherUsageStats = false`. The exact
 application guard `MAX_FILE_BYTES = 2_000_000` SHALL stay.
 R6. README, the UI text and the MCP docstring SHALL state: recognizable unsupported measurement-like rows are listed and stay
@@ -37,10 +38,19 @@ that all invalid measurement lines are detected.
 R7. (Second round, review finding F1.) A line SHALL be skipped as a table heading only WHEN the next line is pipe-delimited, every
 cell of it is a delimiter cell (`:?-{3,}:?`) and it has the same number of columns as the line. A bare `---` SHALL NOT suppress
 the line above it. A delimiter row longer than 2,000 characters SHALL NOT suppress it either, and is reported as `LINE_TOO_LONG`.
-R8. (Review finding F2.) The unit glyphs `Ω` (U+03A9 and U+2126), `℃` (U+2103) and `℉` (U+2109) SHALL count as unit words for
-recognition only (matching uses Unicode compatibility normalization; the reported row text is unchanged). Nothing is converted.
+R8. (Review finding F2, narrowed in round three.) The unit glyphs `Ω` (U+03A9 and U+2126), `℃` (U+2103) and `℉` (U+2109) SHALL count as
+unit words for recognition only. The raw cell is always matched first; an additive mapping of exactly three characters (U+2103 to
+`°C`, U+2109 to `°F`, U+2126 to U+03A9) is tried second. No other character is rewritten: whole-cell Unicode compatibility
+normalization (NFKC) SHALL NOT be used, because it changed `m²` to `m2`, circled revision labels to digits and compatibility letters
+to ASCII. The reported row text is unchanged and nothing is converted.
 R9. (Review finding F4.) The banned-claim check SHALL run on rendered user-visible text as well as on source text, for the
 surfaces that the tests render. It does not prove that no future wording can overclaim.
+R10. (Round three, review findings N1 to N3.) Standing rule: a row that the first commit (c721a6d1) warned about SHALL still be warned,
+and a control that the first commit kept quiet SHALL stay quiet, unless this spec lists the exception and the reason. Listed
+exceptions: none for warnings lost; the first commit's own conservative warnings (`Rev | Date | 2026-11-13`, `pc`, `pcs`, `A`,
+a full-width digit label) are unchanged.
+R11. (Review finding N2.) Heading structure counts UNESCAPED pipes only: `\|` stays inside its cell and `\\|` is an escaped backslash
+followed by a structural pipe. This applies to the table-heading check only; row recognition and row parsing are unchanged.
 
 ## Known limits (locked by tests, stated in the README)
 False positives: `Rev | Date | 2026-11-13`; list rows such as `Item,count,3 pieces`; unit-named columns that the unit library accepts
@@ -50,7 +60,9 @@ Missed without warning: description-first comma rows outside `.csv`; a value ins
 by extra words; semicolon or tab delimiters; ranges, scientific notation and decimal commas in a late cell; a zero-width space
 inside a qualifier; rows that mix `|` and `,` inside one line; unit glyphs other than the four named in R8 (for example `Å` and `‰`); full-width
 delimiters; a bare number after an unknown unit word. `Nm` in a unit column is
-recognized on Python 3.11 (Pint 0.25.x) and not on 3.12 (Pint 0.26.x); this round does not change that path.
+recognized on Python 3.11 (Pint 0.25.x) and not on 3.12 (Pint 0.26.x); no round changes that path.
+Deliberate loss in round three: the square-millimetre and square-kilogram signs and similar compatibility characters were recognized in
+round two only as a side effect of NFKC. They are not recognized now, exactly as in the first commit; this is recorded, not overlooked.
 Precision and recall of the recognizer have not been measured.
 
 ## Evidence that is not a rate

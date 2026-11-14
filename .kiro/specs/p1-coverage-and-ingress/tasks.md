@@ -9,4 +9,7 @@
 - [x] T6 Independent adversarial review of commit c721a6d1 (Codex, read-only): BLOCK (F1 HIGH, F2 MEDIUM, F3 and F4 LOW).
 - [x] T7 Round two, written test-first: F1 structural table-heading check; F2 recognition-only unit glyphs; F3 input-limit wording and the
       API/upload distinction; F4 rendered-copy check with a split-literal mutation; spec corrections (R3, R4, R7 to R9).
-- [ ] T8 Second independent review (not self-approved). Owner checkpoint before any push, PR, merge or deployment.
+- [x] T8 Second independent review of commit 9f84f0c5 (Codex, read-only): BLOCK (N1 HIGH regression, N2 and N3 MEDIUM, N4 and N5 LOW).
+- [x] T9 Round three, written test-first: N1 raw cell first with an additive three-glyph mapping instead of NFKC; N2 unescaped-pipe heading
+      structure; N3 no label conversion; N4 comments; N5 excerpt wording; standing differential rule (R10).
+- [ ] T10 Third independent review (not self-approved). Owner checkpoint before any push, PR, merge or deployment.
