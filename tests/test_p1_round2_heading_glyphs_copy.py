@@ -360,7 +360,9 @@ def test_f4_a_split_literal_is_invisible_to_the_source_check_but_caught_when_ren
     shutil.copytree(ROOT / "app", tmp_path / "app", ignore=shutil.ignore_patterns("__pycache__"))
     ui = tmp_path / "app" / "ui.py"
     source = ui.read_text(encoding="utf-8")
-    mutated = source.replace('st.title("SpecForge")', 'st.title("SpecForge")\nst.markdown("All invalid " "measurement lines are detected.")', 1)
+    # Adapted for the O1 two-view workbench: the title call is now st.title("SpecForge", anchor=False).
+    title = 'st.title("SpecForge", anchor=False)'
+    mutated = source.replace(title, title + '\nst.markdown("All invalid " "measurement lines are detected.")', 1)
     assert mutated != source
     ui.write_text(mutated, encoding="utf-8")
     assert violations(mutated) == []                                                # the old source-level check cannot see it
