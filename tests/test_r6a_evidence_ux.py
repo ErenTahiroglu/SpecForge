@@ -73,26 +73,25 @@ def _app():
 
 
 def _run(choice):
+    # Adapted for the O1 two-view workbench: the old "use_example" checkbox and "example_choice" radio became one
+    # source selector (key "source"). Pump station is now preselected, so the Basic example is chosen explicitly.
     at = _app()
     at.run()
-    at.checkbox(key="use_example").check().run()
-    if choice:
-        at.radio(key="example_choice").set_value(choice).run()
+    at.segmented_control(key="source").set_value(choice or "Basic").run()
     next(b for b in at.button if b.label == "Run audit").click().run()
     assert not at.exception
     return at
 
 
 def _example_choice_pump(at):
-    return next(o for o in at.radio(key="example_choice").options if PUMP_LABEL in o)
+    return next(o for o in at.segmented_control(key="source").options if PUMP_LABEL in o)
 
 
 def test_pump_station_example_is_selectable_and_never_shows_success():
     at = _app()
     at.run()
-    at.checkbox(key="use_example").check().run()
     pump = _example_choice_pump(at)
-    at.radio(key="example_choice").set_value(pump).run()
+    at.segmented_control(key="source").set_value(pump).run()
     next(b for b in at.button if b.label == "Run audit").click().run()
     assert not at.exception
     assert not at.success                                             # no green banner
@@ -109,8 +108,7 @@ def test_pump_station_example_is_selectable_and_never_shows_success():
 def test_pump_station_cards_show_actual_values_lines_and_rows():
     at = _app()
     at.run()
-    at.checkbox(key="use_example").check().run()
-    at.radio(key="example_choice").set_value(_example_choice_pump(at)).run()
+    at.segmented_control(key="source").set_value(_example_choice_pump(at)).run()
     next(b for b in at.button if b.label == "Run audit").click().run()
     blob = " ".join(m.value for m in at.markdown) + " ".join(c.value for c in at.code)
     for needle in ("10 bar", "900 kPa", "1,000,000 Pa", "900,000 Pa", "line 5", "line 3", "spec.md", "purchasing.csv",
@@ -120,7 +118,8 @@ def test_pump_station_cards_show_actual_values_lines_and_rows():
     assert "P-101 | motor_power | 5 hp" in gaps and '"T-301","design_temperature","95 degC"' in gaps
 
 
-def test_basic_example_remains_the_default_and_is_complete_with_a_conflict():
+def test_basic_example_is_selectable_and_is_complete_with_a_conflict():
+    # Adapted: Basic was the default before the O1 two-view workbench; Pump station is preselected now.
     at = _run(None)
     audit = at.session_state["audit"]
     assert audit["view"].verdict == report.VERDICT_CONFLICTS and audit["view"].coverage_complete is True

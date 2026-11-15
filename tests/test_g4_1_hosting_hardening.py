@@ -27,7 +27,7 @@ def test_privacy_notice_is_shown_on_first_load():
 def test_privacy_notice_is_still_shown_with_a_result():
     at = _app()
     at.run()
-    at.checkbox(key="use_example").check().run()
+    at.segmented_control(key="source").set_value("Basic").run()     # adapted: was the use_example checkbox (Basic)
     next(b for b in at.button if b.label == "Run audit").click().run()
     assert not at.exception and "audit" in at.session_state
     assert any(i.value == NOTICE for i in at.info)

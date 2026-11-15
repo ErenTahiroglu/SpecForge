@@ -141,9 +141,15 @@ def _example_bytes():
 
 def test_d02_stale_result_is_not_shown_when_no_input_is_selected():
     at = _app()
+    # Restored precondition (O1 correction R-02): the app now preselects the Pump station example, which is a ready
+    # input. This test is about "no input selected", so My files is selected explicitly with no upload.
+    at.session_state["source"] = "My files"
     at.session_state["audit"] = {"blocked": True, "issues": [{"code": "X", "message": "old result"}], "files": [], "input_key": "OLD"}
     at.run()
     assert not at.exception
+    assert at.segmented_control(key="source").value == "My files"
+    assert all(u.value is None for u in at.get("file_uploader")) and len(at.get("file_uploader")) == 2    # no uploads
+    assert next(b for b in at.button if b.label == "Run audit").disabled                                    # nothing to run
     assert [w.value for w in at.warning] == [] and "audit" not in at.session_state
     assert any("changed" in i.value for i in at.info)                                    # the user is told why nothing is shown
 
@@ -151,7 +157,7 @@ def test_d02_stale_result_is_not_shown_when_no_input_is_selected():
 def test_d02_result_disappears_after_a_setting_changes_and_returns_after_rerun():
     at = _app()
     at.run()
-    at.checkbox(key="use_example").check().run()
+    at.segmented_control(key="source").set_value("Basic").run()     # adapted: was the use_example checkbox (Basic)
     next(b for b in at.button if b.label == "Run audit").click().run()
     assert not at.exception and any("conflict" in e.value for e in at.error)
     at.slider[0].set_value(5.0).run()
@@ -164,7 +170,7 @@ def test_d02_result_disappears_after_a_setting_changes_and_returns_after_rerun()
 
 def test_d02_result_stays_while_nothing_changes():
     at = _app()
-    at.run(); at.checkbox(key="use_example").check().run()
+    at.run(); at.segmented_control(key="source").set_value("Basic").run()     # adapted: was the use_example checkbox
     next(b for b in at.button if b.label == "Run audit").click().run()
     at.run()                                                                           # unrelated rerun
     assert "audit" in at.session_state and any("conflict" in e.value for e in at.error)
@@ -214,7 +220,7 @@ def test_d03_ui_renders_file_names_as_text():
     ex = _example_bytes()
     key = ingest.input_fingerprint(True, "spec.md", ex[0], "bom.md", ex[1], 1.0)
     at = _app()
-    at.session_state["use_example"] = True
+    at.session_state["source"] = "Basic"                 # adapted: was session_state["use_example"] = True (Basic)
     at.session_state["audit"] = {"blocked": False, "view": v, "result": r, "markdown": report.render_markdown(v), "json": "{}", "input_key": key}
     at.run()
     assert not at.exception
