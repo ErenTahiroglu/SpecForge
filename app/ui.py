@@ -299,6 +299,7 @@ def _run_audit():
 
 
 if run:
+    ss["nav_note"] = None                               # a Previous/Next note never outlives the audit it described (N01)
     ss.pop("audit_outdated", None)
     try:
         _run_audit()

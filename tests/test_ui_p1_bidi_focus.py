@@ -360,3 +360,58 @@ def test_endpoint_navigation_changes_no_export_byte_and_makes_no_extra_engine_ca
     assert len(engine) == 1 and len(_downloads(at)) == 2 and not at.dataframe
     _run_button(at).click().run()
     assert len(engine) == 2                                                             # an explicit second Run adds exactly one
+
+
+# ---------------------------------------------------------------- PR34-N01: a Previous/Next note never outlives its audit
+STALE_NOTE_WORDS = ("Nothing changed", "only one finding", "already the first", "already the last")
+
+
+def _all_captions(at):
+    return " ".join(c.value for c in at.caption)
+
+
+def _strip_stamp(markdown):
+    import re
+    return re.sub(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC", "<stamp>", markdown)
+
+
+@pytest.mark.parametrize("label", ["Previous", "Next"])
+def test_a_new_run_clears_a_boundary_note_from_the_previous_audit(engine, label):
+    at = _pump_detailed()
+    first = at.session_state["audit"]
+    first_json, first_md = first["json"], _strip_stamp(first["markdown"])
+    at.segmented_control(key="filt").set_value("Conflicts").run()
+    _btn(at, label).click().run()                                                      # one-finding list: a no-op note
+    assert _status(at) == "Finding 1 of 1 (only finding in this list) · This list has only one finding. Nothing changed."
+    _run_button(at).click().run()                                                       # a second explicit Run, same input
+    assert not at.exception and len(engine) == 2
+    assert at.segmented_control(key="filt").value == "All" and len(at.selectbox(key="pick").options) == 7
+    assert _status(at) == "Finding 1 of 7 (first finding in this list)"
+    assert not [w for w in STALE_NOTE_WORDS if w in _all_captions(at)]
+    second = at.session_state["audit"]                                                  # same input: same canonical exports
+    assert second["json"] == first_json and _strip_stamp(second["markdown"]) == first_md
+    assert sorted(json.loads(second["json"])) == ["coverage_complete", "input_issues", "result", "verdict"]
+    for view in ("Overview", DETAILED):                                                 # the note does not come back
+        at.segmented_control(key="view_mode").set_value(view).run()
+        assert not [w for w in STALE_NOTE_WORDS if w in _all_captions(at)]
+    assert len(engine) == 2
+
+
+def test_a_blocked_new_run_does_not_carry_an_old_note_into_the_next_result(engine):
+    at = _fresh(("a.md", CLEAN_A + b"\nP-2 | flow | 5 L/min"), ("b.md", CONFLICT_B))        # 1 conflict + 1 not compared
+    _run_button(at).click().run()
+    at.segmented_control(key="view_mode").set_value(DETAILED).run()
+    at.segmented_control(key="filt").set_value("Conflicts").run()
+    _btn(at, "Next").click().run()
+    assert "This list has only one finding. Nothing changed." in _status(at)
+    _upload(at, 1, "b.md", b"\xff\xfe not utf-8")                                         # same name, unreadable bytes
+    _run_button(at).click().run()                                                       # a new attempt that is blocked
+    assert at.session_state["audit"]["blocked"] is True and any("did not run" in e.value for e in at.error)
+    assert at.session_state.get("nav_note") is None and _downloads(at) == []
+    assert not [w for w in STALE_NOTE_WORDS if w in _text(at)]
+    assert len(engine) == 1                                                             # blocked at ingest: no engine call
+    _upload(at, 1, "b.md", CONFLICT_B)                                                  # back to the readable file
+    _run_button(at).click().run()
+    assert len(engine) == 2 and at.segmented_control(key="view_mode").value == DETAILED
+    assert _status(at) == "Finding 1 of 2 (first finding in this list)"
+    assert not [w for w in STALE_NOTE_WORDS if w in _all_captions(at)]
