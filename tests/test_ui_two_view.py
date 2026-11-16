@@ -157,8 +157,12 @@ def test_filters_and_selection_never_change_counts_or_exports():
 
 def _all_keys(at):
     """Walk the selector with Next and collect the raw finding keys (AppTest exposes only formatted option labels)."""
+    # Previous/Next are never disabled (a disabled button drops keyboard focus, P1-F02); the ends clamp. So walk by count.
+    count = len(at.selectbox(key="pick").options)
+    for _ in range(count):
+        next(b for b in at.button if b.label == "Previous").click().run()
     keys = [at.selectbox(key="pick").value]
-    while not next(b for b in at.button if b.label == "Next").disabled:
+    for _ in range(count - 1):
         next(b for b in at.button if b.label == "Next").click().run()
         keys.append(at.selectbox(key="pick").value)
     return keys
@@ -211,15 +215,18 @@ def test_not_compared_items_get_no_counterpart_value():
     assert "not paired" in table and "Pa" not in table
 
 
-def test_overview_buttons_open_the_detailed_view():
+def test_overview_has_no_self_removing_action_buttons_and_navigation_stays_on_the_persistent_view_control():
+    """#32: the former Overview buttons removed themselves when pressed and stranded keyboard focus on the page body.
+    Navigation is now the persistent View and Show controls, which keep focus. Same stored audit, same selection rules."""
     at = _audit_example()
-    first = next(b for b in at.button if b.label == "Open detailed evidence")
-    first.click().run()
-    assert at.session_state["view_mode"] == DETAILED
-    assert at.selectbox(key="pick").value.startswith("conflict|")
-    _set_view(at, "Overview")
-    next(b for b in at.button if b.label == "Review not compared").click().run()
-    assert at.session_state["view_mode"] == DETAILED and at.segmented_control(key="filt").value == "Not compared"
+    labels = [b.label for b in at.button]
+    assert "Open detailed evidence" not in labels and "Review not compared" not in labels
+    text = _markdown(at)
+    assert "choose **Detailed evidence** under **View** above" in text and "choose **Not compared**" in text
+    _set_view(at, DETAILED)
+    assert at.selectbox(key="pick").value.startswith("conflict|")                      # a new audit starts at the first finding
+    at.segmented_control(key="filt").set_value("Not compared").run()
+    assert at.segmented_control(key="filt").value == "Not compared" and at.selectbox(key="pick").value.startswith("gap|")
     assert at.session_state["audit_count"] == 1
 
 
@@ -306,28 +313,26 @@ def _visible_texts(at):
     return parts
 
 
-@pytest.mark.parametrize("code", list(CONTROLS))
-def test_bidi_control_in_a_file_name_is_revealed_and_warned(code):
-    name = f"invoice_{CONTROLS[code]}fdp.md"
+ALL_BIDI = {f"U+{ord(c):04X}": c for c in "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"}
+
+
+@pytest.mark.parametrize("code", list(ALL_BIDI))
+def test_bidi_control_in_a_file_name_is_revealed_warned_and_blocks_the_audit(code):
+    """#31 (OWNER_POLICY_GO_REQUIRED): a directional control in a selected name disables Run audit and shows rename
+    instructions. The name stays revealed on screen. Nothing is audited and no result or download exists."""
+    name = f"invoice_{ALL_BIDI[code]}fdp.md"
     at = _app()
     at.run()
     _upload(at, COMPLETE[0], CONF_COMPLETE[1], name_a=name)
+    assert not at.exception
     warnings = " ".join(w.value for w in at.warning)
-    assert "Check this file name" in warnings and code in warnings and "Markdown" in warnings
+    assert "Rename this file to continue" in warnings and code in warnings and "Run audit is off until you rename a file" in warnings
     label = next(m.value for m in at.markdown if "Selected for Document A" in m.value)
-    assert f"⟨{code}⟩" in label and CONTROLS[code] not in label
-    _run_button(at).click().run()
-    audit = at.session_state["audit"]
-    assert name in audit["json"] and name in json.loads(audit["json"])["result"]["findings"][0]["reference"]["document"]
-    for view in ("Overview", DETAILED):
-        _set_view(at, view)
-        texts = _visible_texts(at)
-        assert any(f"⟨{code}⟩" in t for t in texts), view
-        for t in texts:
-            # Every user control is revealed. The only raw isolates on screen are the balanced pairs the app adds
-            # around user parts of plain-text selector labels.
-            assert not any(c in t for c in CONTROLS.values() if c not in "\u2068\u2069"), (view, t)
-            assert t.count("\u2068") == t.count("\u2069"), (view, t)
+    assert f"⟨{code}⟩" in label and ALL_BIDI[code] not in label
+    assert _run_button(at).disabled
+    assert "audit" not in at.session_state and "audit_count" not in at.session_state and _downloads(at) == []
+    for t in _visible_texts(at):
+        assert not any(c in t for c in ALL_BIDI.values()), t                         # every control is revealed on screen
 
 
 def test_legitimate_right_to_left_name_gets_no_warning():

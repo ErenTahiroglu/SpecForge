@@ -126,6 +126,25 @@ def bidi_in(text) -> list:
     return sorted({f"U+{ord(c):04X}" for c in str(text) if c in BIDI_CONTROLS})
 
 
+# OWNER_POLICY_GO_REQUIRED (#31). A selected file whose NAME contains a directional control cannot be audited until the
+# user renames it: the native upload chip can show such a name in a misleading order and Streamlit offers no hook to fix
+# that. Only the enumerated BIDI_CONTROLS count; Arabic and Hebrew letters and all other characters are never blocked.
+# The gate applies to "My files" only (an example is audited by its own fixed file names). It blocks before any engine call
+# and never changes file bytes, names, the fingerprint or the exports of an accepted file.
+NAME_GATE_SLOTS = (("up_a", "Document A"), ("up_b", "Document B"))
+
+
+def name_problems() -> dict:
+    """{"Document A": ["U+202E"], ...} for the uploads currently held in session state (the previous run's widget value)."""
+    found = {}
+    for slot, label in NAME_GATE_SLOTS:
+        upload = ss.get(slot)
+        codes = bidi_in(upload.name) if upload is not None else []
+        if codes:
+            found[label] = codes
+    return found
+
+
 # ---------------------------------------------------------------- page header and inputs
 # Streamlit drops the state of a widget that is not rendered in a run (the view switch is hidden while there is no
 # result, the filter while Overview is shown). The last choice is kept in a plain key and restored.
@@ -137,6 +156,7 @@ if ss.get("view_mode") != ss["view_pref"]:
 
 def _remember(widget_key, pref_key):
     ss[pref_key] = ss[widget_key]
+    ss["nav_note"] = None
 
 st.title("SpecForge", anchor=False)                      # no self-link icon (a 16 px target, issue #32)
 st.markdown('<p class="sf-sub">Compare the measurements in two engineering documents. '
@@ -174,13 +194,22 @@ with st.container(horizontal=True, vertical_alignment="bottom", gap="small", key
             "and it does not certify a document."
         )
     use_example = source in EXAMPLES
+    _name_problems = {} if use_example else name_problems()
+    name_blocked = bool(_name_problems)
     _ready_now = use_example or (ss.get("up_a") is not None and ss.get("up_b") is not None)
-    run = st.button("Run audit", type="primary", disabled=not _ready_now, key="run")
+    run = st.button("Run audit", type="primary", disabled=not _ready_now or name_blocked, key="run")
+    run = run and not name_blocked                      # defensive: a blocked name never reaches the engine
 
 if use_example:
     _ea, _eb = EXAMPLES[source]
     st.caption(f"Document A: {md(_ea.relative_to(ROOT).as_posix())} · Document B: {md(_eb.relative_to(ROOT).as_posix())} · "
                "synthetic example files. Press Run audit to audit them.")
+elif name_blocked:
+    st.warning("**Run audit is off until you rename a file.** "
+               + " ".join(f"The name of {label} contains invisible text-direction characters ({', '.join(codes)})."
+                          for label, codes in _name_problems.items())
+               + " SpecForge cannot show such a name reliably. Rename the file on your computer, remove the current file "
+                 "with the x in its upload box below, then choose the renamed file. Nothing was audited.")
 elif not _ready_now:
     st.caption("Choose Document A and Document B under My files below, then press Run audit.")
 
@@ -205,10 +234,15 @@ with st.container(key="inputs"):
                                f'{len(_data):,} bytes · SHA-256 {hashlib.sha256(_data).hexdigest()[:12]} · read as {esc(_kind)}</div>')
                     _found = bidi_in(_up.name)
                     if _found:
-                        st.warning(f"**Check this file name.** It contains invisible text-direction characters "
-                                   f"({', '.join(_found)}). The upload box above can show the name in a misleading order, "
-                                   f"for example with a different extension. With those characters made visible the name is: "
-                                   f"{md(_up.name)}. It is read as {md(_kind)}.")
+                        _what = ("**Rename this file to continue.** " if not use_example else
+                                 "**This file is kept but not used while an example is selected.** ")
+                        _then = ("Run audit stays off until you rename the file on your computer, remove this one with the "
+                                 "x in the upload box and choose the renamed file." if not use_example else
+                                 "If you choose My files, Run audit stays off until you rename it.")
+                        st.warning(f"{_what}The name contains invisible text-direction characters ({', '.join(_found)}). "
+                                   f"The upload box above can show the name in a misleading order, for example with a "
+                                   f"different extension. With those characters made visible the name is: "
+                                   f"{md(_up.name)}. It would be read as {md(_kind)}. {_then}")
 
 up_a, up_b = ss.get("up_a"), ss.get("up_b")
 example_a, example_b = EXAMPLES[source] if use_example else (None, None)
@@ -216,8 +250,9 @@ ready = use_example or (up_a is not None and up_b is not None)
 
 
 def _current_key():
-    """Identity of what is selected right now (file CONTENT, slots, mode, settings). None when nothing is ready."""
-    if not ready:
+    """Identity of what is selected right now (file CONTENT, slots, mode, settings). None when nothing is ready or when a
+    file name is blocked, so an old result and its downloads never stay visible next to a blocked name."""
+    if not ready or name_blocked:
         return None
     if use_example:
         return input_fingerprint(True, example_a.name, example_a.read_bytes(), example_b.name, example_b.read_bytes(), tol_pct)
@@ -363,12 +398,6 @@ def _pick_label(row) -> str:
 
 
 # ---------------------------------------------------------------- shared pieces
-def _goto_detailed(sel=None, filt="All"):
-    ss["view_mode"] = ss["view_pref"] = VIEWS[1]
-    ss["filt"] = ss["filt_pref"] = filt
-    ss["sel"] = sel
-
-
 def _evidence(ev):
     """One side of a numeric finding: label, document, location, value as written, SI value, verbatim row."""
     owned_html(f'<div class="sf-ev"><b>{esc(ev.label)}</b> · <bdi>{esc(ev.document)}</bdi>'
@@ -443,7 +472,6 @@ def overview(audit, rows_all):
                 with col:
                     _evidence(ev)
             _difference_line(card, view)
-            st.button("Open detailed evidence", key="ov_open", on_click=_goto_detailed, kwargs={"sel": first["key"]})
     elif view.metrics["compared"] == 0:
         st.markdown("**No measurements were compared; no no-conflict conclusion can be drawn.**")
     else:
@@ -456,12 +484,13 @@ def overview(audit, rows_all):
                 _gap_line(row)
             if len(gaps) > 5:
                 st.caption(f"{len(gaps) - 5} more in Detailed evidence.")
-            st.button("Review not compared", key="ov_gaps_btn", on_click=_goto_detailed, kwargs={"filt": "Not compared"})
     if equivalents:
         st.markdown(f"**Verified equivalent after unit conversion ({len(equivalents)}):** "
                     + "; ".join(f"{md(r['card'].title)} ({md(r['card'].summary or '')})" for r in equivalents))
-    if not conflicts:
-        st.button("Open detailed evidence", key="ov_open", on_click=_goto_detailed)
+    # Navigation is the persistent View control above (it keeps keyboard focus when it is used). Overview has no button that
+    # removes itself when pressed, because that strands keyboard focus on the page body (#32).
+    st.markdown("**To see every finding with its full evidence,** choose **Detailed evidence** under **View** above."
+                + (" Under **Show**, choose **Not compared** to list only the items that were not compared." if gaps else ""))
     if view.notes:
         st.caption(f"{len(view.notes)} note{'s' if len(view.notes) != 1 else ''} in Detailed evidence. Notes do not reduce coverage.")
     st.caption(UNSEEN)
@@ -535,11 +564,35 @@ def inspector(row, view):
 
 def _on_pick():
     ss["sel"] = ss.get("pick")
+    ss["nav_note"] = None
 
 
 def _step(keys, delta):
+    """Previous/Next. Both buttons stay enabled at the ends of the list: a native button that disables itself while it holds
+    keyboard focus drops focus to the page body (#32, P1-F02). There is no wraparound; at an end the selection does not change
+    and a visible note says so."""
     i = keys.index(ss["sel"]) if ss.get("sel") in keys else 0
-    ss["sel"] = keys[max(0, min(len(keys) - 1, i + delta))]
+    j = max(0, min(len(keys) - 1, i + delta))
+    ss["sel"] = keys[j]
+    if len(keys) == 1:
+        note = "This list has only one finding. Nothing changed."
+    elif j == i:
+        note = f"This is already the {'first' if delta < 0 else 'last'} finding. Nothing changed."
+    else:
+        note = None
+    ss["nav_note"] = (keys[j], note) if note else None
+
+
+def _nav_status(pos, count):
+    """Always-visible position text, plus the note left by a press that could not move."""
+    place = "first" if pos == 0 else "last" if pos == count - 1 else ""
+    if count == 1:
+        place = "only"
+    line = f"Finding {pos + 1} of {count}" + (f" ({place} finding in this list)" if place else "")
+    note = ss.get("nav_note")
+    if note and note[0] == ss.get("sel"):
+        line += f" · {note[1]}"
+    return line
 
 
 def detailed(audit, rows_all):
@@ -570,9 +623,10 @@ def detailed(audit, rows_all):
             st.selectbox(f"Finding to inspect ({len(rows)} in this list)", keys, key="pick", format_func=labels.get,
                          on_change=_on_pick)
         with c_prev:
-            st.button("Previous", key="prev", on_click=_step, args=(keys, -1), disabled=pos == 0, width="stretch")
+            st.button("Previous", key="prev", on_click=_step, args=(keys, -1), width="stretch")
         with c_next:
-            st.button("Next", key="next", on_click=_step, args=(keys, 1), disabled=pos == len(keys) - 1, width="stretch")
+            st.button("Next", key="next", on_click=_step, args=(keys, 1), width="stretch")
+        st.caption(_nav_status(pos, len(keys)))
         row = rows[pos]
         with st.container(border=True, key="inspector"):
             inspector(row, view)
@@ -593,7 +647,9 @@ with result_slot:
     audit = ss.get("audit")
     if not audit and ss.get("audit_outdated"):
         st.info("The documents or the settings changed since the last audit, so the old result was removed. "
-                + ("Press Run audit to audit them again." if ready else "Select both documents, then press Run audit."))
+                + ("Press Run audit to audit them again." if ready and not name_blocked else
+                   "Rename the file named in the message above, then choose it again." if name_blocked else
+                   "Select both documents, then press Run audit."))
     if audit and audit["blocked"]:
         st.error("The audit did not run. Fix the problem below and try again.")
         for issue in audit["issues"]:
