@@ -4,7 +4,7 @@ SpecForge compares measurements in two engineering documents. It reads structure
 
 It is a Kiroween 2026 **Frankenstein** candidate, developed with Kiro (specifications, steering, hooks and an MCP tool are in [`.kiro/`](.kiro/)).
 
-**Status:** a working application that runs locally. A public Streamlit Community Cloud app exists at <https://kirospecforge.streamlit.app/>. It tracks the `main` branch and, when last observed (2026-11-17), still showed the **older interface** (a checkbox "Use an example"). The new Source and View interface described below is in the `development` release candidate and is **not yet deployed to `main`**, so it is not live. SpecForge is **not a certification** of any document, and a result without conflicts covers only the rows that were actually compared.
+**Status:** a working application that runs locally. A public Streamlit Community Cloud app exists at <https://kirospecforge.streamlit.app/>. The interface it shows depends on which reviewed revision of the `main` branch has been deployed (see [Hosted operation](#hosted-operation-streamlit-community-cloud)). The Source and View interface described below is the interface of this source tree. SpecForge is **not a certification** of any document, and a result without conflicts covers only the rows that were actually compared.
 
 ## Local and hosted operation
 
@@ -14,11 +14,12 @@ It is a Kiroween 2026 **Frankenstein** candidate, developed with Kiro (specifica
 - The deterministic audit uses no external AI API and no language model.
 - [`.streamlit/config.toml`](.streamlit/config.toml) sets `gatherUsageStats = false`, so Streamlit's own usage statistics are not collected in local runs that read this file (start Streamlit from the repository root).
 
-### Hosted operation (public app, older interface)
+### Hosted operation (Streamlit Community Cloud)
 
 A public app runs on Streamlit Community Cloud at <https://kirospecforge.streamlit.app/>.
 
-- **Version.** The Cloud app tracks `main`. When last observed (2026-11-17) it showed the older interface with the checkbox "Use an example (synthetic documents) instead of my own files". The Source and View selectors in this README are not live until an explicitly approved promotion of the new interface to `main`. The running commit, the hosting Python version and the installed dependency versions are **UNKNOWN**: the page does not show them. This README makes no claim about them. Hosted quality checks of the new interface have **not** been run.
+- **Deployed version.** The Cloud app tracks the `main` branch. The hosted interface is the interface of whichever `main` revision the platform has deployed. It can differ from the Source and View interface described in this README. Historical observation: on 2026-11-17, before the Source and View interface was promoted to `main`, the public app showed an older interface with the checkbox "Use an example (synthetic documents) instead of my own files". The running commit SHA of the public app is **UNKNOWN** (`RUNTIME_SHA_UNKNOWN`): the page does not show it and the platform startup log does not contain one. This README makes no claim about hosted quality checks of the interface that is currently deployed.
+- **Historical startup receipt.** The Cloud startup log of 2026-11-17 (about 15:39 UTC) records Python 3.12.16, Streamlit 1.67.0, and a platform replacement of PyArrow 26.0.1 by 24.0.0 after the platform detected a known crash risk in 26.0.1. This is a record of one past startup. It does not prove which packages or which commit run now, and a later deployment can differ.
 - **Server-side processing.** Documents you upload on the hosted app are transmitted to the hosting server and processed there. **Do not upload confidential documents.** Upload only synthetic or non-confidential documents. The app shows this notice above the upload controls. To keep documents on your own machine, run SpecForge locally.
 - **Platform telemetry and third-party requests.** The hosting provider's own logging, analytics and privacy policies apply. On Streamlit Community Cloud, the platform sets `gatherUsageStats = true` and overrides the repository setting ([Community Cloud status and limitations](https://docs.streamlit.io/deploy/streamlit-community-cloud/status)). The repository configuration does **not** disable that telemetry. In one read-only observation the hosted page requested analytics and asset hosts of the platform (for example `cdn.segment.com`, `cdn.heapanalytics.com` and `data.streamlit.io`). The page is **not** free of third-party requests. The statement "the audit engine makes no network calls of its own" covers the audit code only, not the hosting platform or the browser page.
 - **Hosting limits.** The free app can sleep when unused and may need time to wake up. The upload limit is about 2 MB for each file (see [Source format and limits](#source-format-and-limits)). Availability is not guaranteed.
@@ -51,7 +52,7 @@ Direct dependencies are pinned to the versions tested on Python 3.11 and 3.12 (s
 python -m streamlit run app/ui.py
 ```
 
-This is the interface of the development release candidate. The public Cloud app may still show the older interface (see [Hosted operation](#hosted-operation-public-app-older-interface)).
+This is the interface of this source tree. The hosted interface depends on the deployed `main` revision (see [Hosted operation](#hosted-operation-streamlit-community-cloud)).
 
 - **Source.** Choose one of three sources: **Basic** (`examples/spec.md` and `examples/bom.md`, synthetic), **Pump station** (`examples/pump_station/`, synthetic) or **My files**. For My files, choose Document A and Document B (`.md`, `.txt`, `.csv` or text-based `.pdf`) in the upload boxes. Choosing a file switches the source to My files.
 - **Run audit.** Press **Run audit** to start an audit. The audit engine runs once for each press. Changing the source, the files or the tolerance after a run removes the old result, so press **Run audit** again.
@@ -89,7 +90,7 @@ The files in [`examples/`](examples/) are synthetic fixtures. Comparing `example
 
 ### Demonstration: pump station (synthetic)
 
-[`examples/pump_station/`](examples/pump_station/) holds a fully synthetic two-document case (a specification and a purchasing sheet). It is teaching data, not from any real project, customer or supplier. To reproduce it in the release-candidate interface: start the web interface, choose **Pump station** under **Source**, press **Run audit** (or choose **My files** and upload `spec.md` as Document A and `purchasing.csv` as Document B). In the older interface, tick **Use an example** and choose **Pump station**. The result is fixed:
+[`examples/pump_station/`](examples/pump_station/) holds a fully synthetic two-document case (a specification and a purchasing sheet). It is teaching data, not from any real project, customer or supplier. To reproduce it: start the web interface, choose **Pump station** under **Source**, press **Run audit** (or choose **My files** and upload `spec.md` as Document A and `purchasing.csv` as Document B). The older interface of 2026-11-17 used the checkbox **Use an example** instead of the Source selector. The result is fixed:
 
 - Verdict `CONFLICTS_FOUND` and `coverage_complete = false`, shown as "Conflicts found" and "Coverage incomplete: 4 items not compared".
 - One conflict, `P-101 · pressure`: `10 bar` (spec.md, line 5) against `900 kPa` (purchasing.csv, line 3), that is 1,000,000 Pa against 900,000 Pa, a 10 % difference.
@@ -155,11 +156,11 @@ The optional field `dimension_key` in results is informational (sorted `[dimensi
 - **File-name check.** The uploader can show a misleading name when it contains invisible text-direction characters. SpecForge blocks 12 such characters. It does not prevent all Unicode look-alike names.
 - **Accessibility.** No accessibility conformance is claimed. Keyboard and layout checks were run only in a headless Brave browser on macOS with synthetic files. Physical keyboard use, screen readers, real browser zoom, real devices and other browsers have **not** been tested. Known gaps: at narrow widths a selector label can sit partly under the page header, the focus border of the finding selector is thin, some targets are 24 to 32 px, and the native copy button of a code block is not reliably reachable by keyboard.
 - **Review.** Checks were made by the author, by automated tests (GitHub Actions on Python 3.11 and 3.12) and by earlier independent reviews of earlier states. They are not a full independent review of the final release candidate.
-- **Hosted app.** Hosted quality checks of the new interface and the running commit of the public app are **UNKNOWN** (see [Hosted operation](#hosted-operation-public-app-older-interface)).
+- **Hosted app.** The running commit of the public app is **UNKNOWN**, and this README does not claim hosted quality checks of the interface that is currently deployed (see [Hosted operation](#hosted-operation-streamlit-community-cloud)).
 
 ## Kiroween submission status
 
-The contest requires meaningful use of Kiro, a public repository with an open-source license and a tracked `.kiro/` directory, a working application URL, and a public video under three minutes. This repository covers the source, license and `.kiro/` parts. A public Cloud app exists (see [Hosted operation](#hosted-operation-public-app-older-interface)), but it shows the older interface and the new interface has not been checked on it. The demo video and the written Kiro narrative are **not done**. Official rules: <https://kiroween.devpost.com/rules>.
+The contest requires meaningful use of Kiro, a public repository with an open-source license and a tracked `.kiro/` directory, a working application URL, and a public video under three minutes. This repository covers the source, license and `.kiro/` parts. A public Cloud app exists (see [Hosted operation](#hosted-operation-streamlit-community-cloud)). This README does not claim hosted quality checks of the interface that is currently deployed. The demo video and the written Kiro narrative are **not done**. Official rules: <https://kiroween.devpost.com/rules>.
 
 ## License
 
