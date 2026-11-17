@@ -75,6 +75,9 @@ st.markdown(
 .sf-tbl td {padding: .45rem .6rem; border-bottom: 1px solid rgba(128,128,128,.22); vertical-align: top; overflow-wrap: anywhere;}
 .sf-tbl td.m {font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums;}
 .sf-tbl tr.sel td {background: rgba(128,128,128,.16);}
+/* PR34-V02: when keyboard focus scrolls the finding selector or Previous/Next into view inside the main scroll area,
+   keep them clear of the Streamlit header (60 px) and their focus ring. Scoped to the app's own keyed controls only. */
+.st-key-pick input, .st-key-prev button, .st-key-next button {scroll-margin-top: 4.5rem; scroll-margin-bottom: 1rem;}
 @media (max-width: 640px) {
   .sf-tbl thead {display: none;}
   .sf-tbl tr {display: block; padding: .4rem 0; border-bottom: 1px solid rgba(128,128,128,.35);}
