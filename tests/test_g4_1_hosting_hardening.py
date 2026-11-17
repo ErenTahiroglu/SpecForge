@@ -65,7 +65,8 @@ def test_direct_dependencies_are_pinned_exactly():
 
 def test_readme_separates_local_and_hosted_operation():
     text = (ROOT / "README.md").read_text(encoding="utf-8")
-    assert "### Local operation" in text and "### Hosted operation (planned, not yet deployed)" in text
+    assert "### Local operation" in text and "### Hosted operation (Streamlit Community Cloud)" in text
+    assert "https://kirospecforge.streamlit.app/" in text       # the real public application URL
     assert "gatherUsageStats = true" in text                     # the Community Cloud override is disclosed
     assert "uses no network" not in text                        # the old unconditional claim is gone
     assert "Use the example documents" not in text              # matches the real checkbox label
