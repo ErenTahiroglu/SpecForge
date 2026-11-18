@@ -26,7 +26,7 @@ REASONS = {
     "DUPLICATE_IDENTIFIER": "The same tag and property appear more than once in one document.",
     "DIMENSION_MISMATCH": "The two values have different physical dimensions. They cannot be compared.",
     "AMBIGUOUS_COMPARISON": "One file gives different values for this item, so no single value can be compared with the other file.",
-    "TEMPERATURE_SEMANTICS": "A temperature difference and an absolute temperature cannot be compared.",
+    "TEMPERATURE_SEMANTICS": "The kind of temperature (absolute or difference) is not clear or not the same, so the values were not compared.",
 }
 
 

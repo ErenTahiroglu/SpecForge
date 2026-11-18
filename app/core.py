@@ -70,8 +70,12 @@ _AMBIGUOUS_CANONICAL = {"gallon": "gallon", "quart": "quart", "pint": "pint", "c
                         "british_thermal_unit": "btu", "ton": "ton", "barrel": "barrel"}
 
 # --- D05: temperature differences are not absolute temperatures ---
-_INTERVAL_WORDS = {"delta", "difference", "differential", "diff", "rise", "drop", "interval", "dt"}
+# FR-03 (#47): only these words make a property name a clear label. Abbreviations (DT, diff, dTemp) and domain terms
+# (superheat, approach, range ...) do not: their meaning depends on the document, so the kind stays "unknown".
+_INTERVAL_WORDS = {"delta", "difference", "differential", "rise", "drop", "interval"}
 _ABSOLUTE_WORDS = {"temperature", "temp"}
+_UNCLEAR_TEMPERATURE_WORDS = {"dt", "dtemp", "dtemperature", "dtmp", "diff", "superheat", "superheating", "subcool",
+                              "subcooling", "subcooled", "approach", "range", "span", "spread", "margin"}
 _OFFSET_TO_DELTA = {"degree_Celsius": "delta_degC", "degree_Fahrenheit": "delta_degF"}
 MAX_CHARS = 200_000
 MAX_LINES = 5_000
@@ -92,6 +96,98 @@ _EXCERPT_CHARS = 200
 ZERO_TOLERANCE_FLOOR = 1e-12
 _TINY = sys.float_info.min   # smallest normal double; a nonzero value below this has lost precision and is not compared
 SCOPE = "Structured rows only; not a general PDF/P&ID semantic audit"
+
+# --- FR-01 (#45): bounded unit-expression syntax. Checked BEFORE any text reaches Pint. ---
+# Pint evaluates the unit text as an expression. A chained exponent such as `m^9^9^9` makes it compute a huge integer power
+# and can keep one audit busy for a very long time (it holds the interpreter lock). This guard is a small lexical grammar,
+# not a blacklist of one string:
+#   unit  := term (("*" | "/") term)*                      at most MAX_UNIT_TERMS terms, at most MAX_UNIT_CHARS characters
+#   term  := name [ ("^" | "**") exponent | digits ]       at most ONE exponent per term; digits = implicit exponent (m2, m\u00b2)
+#   name  := letters, "_", "%", degree, micro and ohm signs (no ASCII or other digits, no spaces, no brackets)
+#   exponent := [+-] 1-2 ASCII digits [ "." 1-9 ASCII digits ]   a literal, never an expression
+# So no exponent can contain another exponent, and every exponent is a short literal. Anything else is refused with a stable
+# code. The scan is linear in the length. This is bounded syntactic rejection; it is not a claim of immunity against every
+# possible slow input.
+MAX_UNIT_CHARS = 64
+MAX_UNIT_TERMS = 8
+_ASCII_DIGITS = "0123456789"
+_SUPERSCRIPT_DIGITS = "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079"   # m\u00b2, kg/m\u00b3
+_SUPERSCRIPT_SIGNS = "\u207a\u207b"
+_UNIT_NAME_SYMBOLS = "_\u00b0\u00b5\u03bc\u03a9%"
+
+
+def _scan_unit_name(unit: str, pos: int) -> int:
+    end = pos
+    while end < len(unit) and (unit[end].isalpha() or unit[end] in _UNIT_NAME_SYMBOLS):
+        end += 1
+    return end
+
+
+def _scan_exponent_literal(unit: str, pos: int):
+    """End of an exponent literal that starts at pos, or None when there is none."""
+    n, i = len(unit), pos
+    if i < n and unit[i] in "+-":
+        i += 1
+    start = i
+    while i < n and unit[i] in _ASCII_DIGITS and i - start < 2:
+        i += 1
+    if i == start:
+        return None
+    if i + 1 < n and unit[i] == "." and unit[i + 1] in _ASCII_DIGITS:
+        j = i + 1
+        while j < n and unit[j] in _ASCII_DIGITS and j - (i + 1) < 9:
+            j += 1
+        i = j
+    return i
+
+
+def unit_syntax_problem(unit):
+    """None when the unit text is inside the bounded grammar above, else a stable code:
+    EMPTY, TOO_LONG, TOO_MANY_TERMS, BAD_SYNTAX, BAD_EXPONENT, CHAINED_EXPONENT, EXPONENT_TOO_LARGE.
+    Pure text scan. It never calls Pint."""
+    if not isinstance(unit, str) or not unit:
+        return "EMPTY"
+    n = len(unit)
+    if n > MAX_UNIT_CHARS:
+        return "TOO_LONG"
+    pos, terms = 0, 0
+    while True:
+        end = _scan_unit_name(unit, pos)
+        if end == pos:
+            return "BAD_SYNTAX"
+        terms += 1
+        if terms > MAX_UNIT_TERMS:
+            return "TOO_MANY_TERMS"
+        pos, has_exponent = end, False
+        operator = 1 if unit.startswith("^", pos) else 2 if unit.startswith("**", pos) else 0
+        if operator:
+            end = _scan_exponent_literal(unit, pos + operator)
+            if end is None:
+                return "BAD_EXPONENT"
+            pos, has_exponent = end, True
+        elif pos < n and unit[pos] in _ASCII_DIGITS:        # implicit exponent: m2
+            end = pos
+            while end < n and unit[end] in _ASCII_DIGITS and end - pos < 2:
+                end += 1
+            pos, has_exponent = end, True
+        elif pos < n and unit[pos] in _SUPERSCRIPT_DIGITS + _SUPERSCRIPT_SIGNS:       # superscript exponent: m\u00b2, m\u207b\u00b2
+            end = pos + (1 if unit[pos] in _SUPERSCRIPT_SIGNS else 0)
+            start = end
+            while end < n and unit[end] in _SUPERSCRIPT_DIGITS and end - start < 2:
+                end += 1
+            if end == start:
+                return "BAD_EXPONENT"
+            pos, has_exponent = end, True
+        if pos == n:
+            return None
+        if unit[pos] == "^" or unit.startswith("**", pos):
+            return "CHAINED_EXPONENT" if has_exponent else "BAD_EXPONENT"
+        if unit[pos] in _ASCII_DIGITS or unit[pos] in _SUPERSCRIPT_DIGITS:
+            return "EXPONENT_TOO_LARGE"
+        if unit[pos] in "*/":
+            pos += 1
+            continue
+        return "BAD_SYNTAX"
 
 
 @dataclass(frozen=True)
@@ -271,7 +367,14 @@ def _unit_like_raw(cell: str) -> bool:
     """True when the RAW cell is a unit the engine knows, refuses as ambiguous, a gauge/absolute pressure spelling, or the omega sign."""
     if not _UNIT_TOKEN.fullmatch(cell):
         return False
-    if cell == "\u03a9" or _PRESSURE_BASIS_UNIT.fullmatch(cell) or ambiguous_unit(cell):
+    if cell == "\u03a9" or _PRESSURE_BASIS_UNIT.fullmatch(cell):
+        return True
+    if unit_syntax_problem(cell):
+        # FR-01: outside the grammar, Pint is never asked. An exponent-shaped token is still a unit column, so that the
+        # row beside it is reported (UNPARSED_ROW) and not taken for prose; other refused shapes (for example a hyphenated
+        # word) are not units.
+        return "^" in cell or "**" in cell
+    if ambiguous_unit(cell):
         return True
     try:
         UNITS.Quantity(1, ALIASES.get(cell, cell))
@@ -395,12 +498,11 @@ def _words(text: str) -> set:
 def _temperature_kind(base_names: list, field: str) -> str:
     """Classify a pure-temperature quantity from its unit and its property name."""
     words = _words(field)
-    interval_property = bool(words & _INTERVAL_WORDS)
     if any(n.startswith("delta_") for n in base_names):
-        return "interval"
-    if any(n in _OFFSET_TO_DELTA for n in base_names):
-        return "interval" if interval_property else "absolute"
-    if interval_property:
+        return "interval"                                   # explicit unit: delta_degC, delta_degF
+    if words & _UNCLEAR_TEMPERATURE_WORDS:
+        return "unknown"                                    # DT, diff, superheat ...: never guessed (FR-03)
+    if words & _INTERVAL_WORDS:
         return "interval"
     return "absolute" if words & _ABSOLUTE_WORDS else "unknown"
 
@@ -451,6 +553,12 @@ def _parse(name: str, text: str):
             value_error = NumericRangeError("a number is too large to represent")
         else:
             value_error = None
+        syntax = unit_syntax_problem(unit)
+        if syntax:                         # FR-01: Pint is not called for unit text outside the bounded grammar
+            coverage["rows_unsupported_unit"] += 1
+            warnings.append({"code": "UNSUPPORTED_UNIT", "document": name, "line": line_number, "excerpt": raw.strip(),
+                             "reason": "UnitSyntaxError", "detail": syntax})
+            continue
         ambiguous = ambiguous_unit(unit)
         if ambiguous:
             word, alternatives = ambiguous
@@ -506,17 +614,71 @@ def source_name(document: str) -> str:
     return base if sep and page.isdigit() else document
 
 
-def _temperature_pair(ref: Observation, other: Observation):
-    """D05. Returns None when the pair may be compared, else (detail, message)."""
-    if ref.dimension != "[temperature]":
+_TEMPERATURE_MESSAGES = {
+    "interval_vs_absolute": "One value is a temperature difference and the other is an absolute temperature. They are not comparable.",
+    "uncertain": "One value is a temperature difference. The other (for example a plain K) could be a temperature or a difference. "
+                 "Name the property 'temperature difference' or use delta_degC to make the meaning explicit.",
+    "unknown_kind": "The kind of at least one temperature is not clear (absolute temperature or temperature difference), and a degC or "
+                    "degF value converts differently in each case. Use delta_degC or delta_degF for a difference, or name the property "
+                    "'temperature' for an absolute temperature. Abbreviations such as DT and terms such as superheat do not decide the kind.",
+}
+
+
+@functools.lru_cache(maxsize=256)
+def _has_offset_unit(unit: str) -> bool:
+    """True for degC and degF (offset scales). Fails closed (True) when the unit text cannot be read."""
+    if unit_syntax_problem(unit):
+        return True
+    try:
+        names = {name for name, _ in UNITS.Quantity(1, ALIASES.get(unit, unit)).unit_items()}
+    except Exception:
+        return True
+    return bool(names & set(_OFFSET_TO_DELTA))
+
+
+def _temperature_group_problem(records):
+    """D05, H2-001, FR-03. For records of one tag+property that share the temperature dimension, return
+    (detail, message, first, second) for a pair that must not be compared, else None. O(n), and equal to checking every pair:
+      - an interval beside an absolute temperature, or beside an unknown kind, is never comparable;
+      - an unknown kind is comparable only when no offset unit (degC, degF) is involved, or when value and unit are identical
+        (identical text gives the same answer under every reading).
+    The two returned records are listed in the order of `records`."""
+    if not records or any(r.dimension != "[temperature]" for r in records):
         return None
-    kinds = {ref.quantity_kind, other.quantity_kind}
-    if kinds == {"interval", "absolute"}:
-        return ("interval_vs_absolute", "One value is a temperature difference and the other is an absolute temperature. They are not comparable.")
-    if "interval" in kinds and "unknown" in kinds:
-        return ("uncertain", "One value is a temperature difference. The other (for example a plain K) could be a temperature or a difference. "
-                             "Name the property 'temperature difference' or use delta_degC to make the meaning explicit.")
+    first_of = {}
+    for record in records:
+        first_of.setdefault(record.quantity_kind, record)
+    position = {id(record): index for index, record in enumerate(records)}
+
+    def found(detail, a, b):
+        a, b = sorted((a, b), key=lambda r: position[id(r)])
+        return detail, _TEMPERATURE_MESSAGES[detail], a, b
+
+    interval = first_of.get("interval")
+    if interval is not None:
+        if "absolute" in first_of:
+            return found("interval_vs_absolute", interval, first_of["absolute"])
+        if "unknown" in first_of:
+            return found("uncertain", interval, first_of["unknown"])
+    unknowns = [r for r in records if r.quantity_kind == "unknown"]
+    if unknowns:
+        unknown_offset = next((u for u in unknowns if _has_offset_unit(u.unit)), None)
+        if unknown_offset is not None:
+            differing = next((r for r in records if r is not unknown_offset
+                              and (r.value, r.unit) != (unknown_offset.value, unknown_offset.unit)), None)
+            if differing is not None:
+                return found("unknown_kind", unknown_offset, differing)
+        unknown_linear = next((u for u in unknowns if not _has_offset_unit(u.unit)), None)
+        offset_record = next((r for r in records if _has_offset_unit(r.unit)), None)
+        if unknown_linear is not None and offset_record is not None:
+            return found("unknown_kind", unknown_linear, offset_record)
     return None
+
+
+def _temperature_pair(ref: Observation, other: Observation):
+    """Returns None when the pair may be compared, else (detail, message)."""
+    problem = _temperature_group_problem([ref, other])
+    return problem[:2] if problem else None
 
 
 # Authoritative audit verdicts. `status` below keeps the original comparison outcome; `verdict` is what consumers
@@ -619,6 +781,29 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
                     findings.append({"code": "INTERNAL_CONTRADICTION", "scope": "same_source", "tag": tag, "field": field,
                                      "relative_difference": reported_difference(error),
                                      "reference": asdict(first), "other": asdict(other)})
+            # FR-02 (#46): a repeat that is close to the FIRST row can still contradict another repeat (approximate equality
+            # is not transitive). Every pair must be compatible, not only each repeat with the first one.
+            if consistent:
+                problem = _temperature_group_problem(same)       # a pair that does not include the first row
+                if problem:
+                    consistent = False
+                    group_warnings.append({"code": "TEMPERATURE_SEMANTICS", "scope": "same_source", "detail": problem[0],
+                                           "message": problem[1], "tag": tag, "field": field,
+                                           "reference": asdict(problem[2]), "other": asdict(problem[3])})
+            if consistent:
+                # Here allowed < 1 (tolerance <= 0.2). Two values of opposite sign, or zero and nonzero, differ by 1 or more,
+                # so they are always inconsistent, and the minimum and maximum are such a pair whenever the group is not
+                # strictly one-signed. In a one-signed group the relative difference 1 - (smaller / larger magnitude) is
+                # largest for the smallest and largest magnitude, that is for the minimum and the maximum. So the group is
+                # consistent exactly when the minimum and the maximum are within the allowed difference. O(n).
+                low, high = min(same, key=lambda r: r.si_value), max(same, key=lambda r: r.si_value)
+                error = relative_error(low, high)
+                if error > allowed:
+                    consistent = False
+                    low, high = sorted((low, high), key=lambda r: same.index(r))
+                    findings.append({"code": "INTERNAL_CONTRADICTION", "scope": "same_source", "tag": tag, "field": field,
+                                     "relative_difference": reported_difference(error),
+                                     "reference": asdict(low), "other": asdict(high)})
             group_warnings.append({
                 "code": "DUPLICATE_IDENTIFIER", "document": source, "tag": same[0].tag, "field": same[0].field,
                 "lines": [r.line for r in same], "excerpts": [r.excerpt for r in same],

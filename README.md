@@ -29,6 +29,7 @@ A public app runs on Streamlit Community Cloud at <https://kirospecforge.streaml
 - Rows are matched by tag and property (case-insensitive) across the two documents.
 - Values are converted with Pint and compared with a relative tolerance (default 1 %, allowed range 0–20 %). The relative difference is `|a − b| / max(|a|, |b|)`.
 - Unsupported or ambiguous rows are reported as warnings or incomplete coverage. They are never counted as a pass.
+- **Repeated rows in one file.** If one file repeats a tag and property, every repeat must agree with every other repeat, not only with the first one. The smallest and the largest value (after conversion to SI) must be within the effective tolerance (this is equivalent to checking every pair, because the allowed difference is below 1; see the comment in `app/core.py`). Otherwise the file contradicts itself: the result carries an `INTERNAL_CONTRADICTION` finding with both decisive rows, nothing from that file is compared with the other file for this item, and `coverage_complete` is `false`. This does not depend on the row order. Pages of one PDF count as one file. Repeats across three or more files still use the first file as the reference (known limit, issue #19).
 - Equal dimensions are **not** proof of equal meaning: for example torque and energy share a dimension. The engine does not know what a property means, and it does not check gauge versus absolute pressure.
 
 ## Quick start
@@ -122,9 +123,24 @@ If either is not true, replace `command` with the absolute path of the project's
 
 One measurement per line: `P-101 | pressure | 10 bar`. Markdown table rows with outer pipes also work. In `.csv` files, `P-101,pressure,10 bar` and `P-101,pressure,10,bar` also work (quoted CSV fields are not supported). In the web interface, PDF upload is off unless a local run opts in (see [Web interface](#web-interface)). With the opt-in, PDFs are read as text, best effort, up to 10 pages per file; evidence for a PDF is page-level. See [PDF limits](#pdf-limits) and [Number handling](#number-handling) below.
 
-Units with more than one meaning are refused, not guessed: `ton`, `gallon`, `quart`, `pint`, `cal`, `hp`, `Btu`, `bbl`/`barrel` and their short or plural forms. Use an explicit unit such as `short_ton`, `tonne`, `US_liquid_gallon`, `imperial_gallon`, `international_calorie`, `metric_horsepower` or `oil_barrel`. Temperature differences (`delta_degC`, or a property named difference, rise, drop or delta T) are never compared with absolute temperatures.
+Units with more than one meaning are refused, not guessed: `ton`, `gallon`, `quart`, `pint`, `cal`, `hp`, `Btu`, `bbl`/`barrel` and their short or plural forms. Use an explicit unit such as `short_ton`, `tonne`, `US_liquid_gallon`, `imperial_gallon`, `international_calorie`, `metric_horsepower` or `oil_barrel`.
 
 Not supported: scanned PDFs, OCR, drawings, P&ID images, free text, decimal commas (`10,5`), scientific notation (`1e3`), and gauge/absolute pressure units (`barg`, `bara`). Rows with a decimal comma, an exponent or an unsupported unit are reported as `UNPARSED_ROW` or `UNSUPPORTED_UNIT` warnings and are not compared. Quoted fields (`"P-101","pressure","10 bar"`, also in pipe rows) are not supported: a measurement-like row that uses them is **not compared** and is reported as an `UNPARSED_ROW` warning with its document, line and text, so the audit shows as incomplete (never as a clean pass). A non-measurement quoted line, such as a header, is not reported.
+
+### Temperature semantics
+
+A value in `degC` or `degF` converts differently as an absolute temperature (0 degC = 273.15 K) and as a temperature difference (5 degC = 5 K), and the relative difference depends on that choice. SpecForge does not guess the kind. It takes it only from:
+
+- the **unit**: `delta_degC` and `delta_degF` are differences;
+- a **clear property label**: a name with the word `difference`, `differential`, `delta`, `rise`, `drop` or `interval` is a difference; a name with `temperature` or `temp` is an absolute temperature.
+
+These names are **not** clear labels, and the kind stays unknown: abbreviations (`DT`, `dT`, `diff`, `dTemp`) and domain-dependent terms (`superheat`, `subcooling`, `approach`, `range`, `span`, `spread`, `margin`), also when the word `temperature` is next to them. A name with none of the words has an unknown kind too. This list of words is not an ontology; it is a short conservative rule.
+
+Result: a difference is never compared with an absolute temperature (`detail: interval_vs_absolute`) or with an unknown kind (`uncertain`). A `degC` or `degF` value of unknown kind is not compared with a different value (`detail: unknown_kind`). Identical text (same number and same unit) is compared, because every reading gives the same answer. Plain `K` and `degR` of unknown kind are compared with each other, because no offset is involved. All refusals are reported as `TEMPERATURE_SEMANTICS` with both rows, and `coverage_complete` is `false`. To compare temperatures, name the property `temperature` or use `delta_degC` / `delta_degF`.
+
+### Unit text syntax
+
+Unit text is read by Pint only after a small text check (`unit_syntax_problem` in `app/core.py`): at most 64 characters and 8 terms, joined by `*` or `/`; each term is a name with at most one exponent (`m^2`, `m**2`, `m2`, `m²`, `s^-1`, `m^0.5`); an exponent is a literal of at most 2 digits and 9 decimals. Chained exponents (an exponent that contains an exponent), non-literal exponents, brackets, spaces and other expressions are refused. A refused row is not dropped: it is reported as `UNSUPPORTED_UNIT` with `reason: UnitSyntaxError` and a `detail` code (`CHAINED_EXPONENT`, `BAD_EXPONENT`, `EXPONENT_TOO_LARGE`, `TOO_LONG`, `TOO_MANY_TERMS`, `BAD_SYNTAX`, `EMPTY`), with its document, line and text, and `coverage_complete` is `false`. In a table row that the recognizer reports as `UNPARSED_ROW`, an exponent-shaped unit column is recognized by text only. This is bounded syntactic rejection. It is not a promise that every input is processed quickly.
 
 ### PDF limits
 
