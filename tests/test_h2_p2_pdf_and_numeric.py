@@ -366,7 +366,8 @@ EQUIVALENT = [("12 L/min", "0.0002 m^3/s"), ("36 m^3/h", "0.01 m^3/s"), ("1 bar"
 @pytest.mark.parametrize("a,b", EQUIVALENT)
 def test_equivalent_converted_values_are_equal_at_zero_tolerance(a, b):
     for x, y in ((a, b), (b, a)):
-        r = audit_documents({"a.md": f"P-1 | v | {x}", "b.md": f"P-1 | v | {y}"}, 0.0)
+        # The property is named "temperature": an unlabelled degC/degF value is refused since #47, and this test is about rounding.
+        r = audit_documents({"a.md": f"P-1 | temperature | {x}", "b.md": f"P-1 | temperature | {y}"}, 0.0)
         assert not r["findings"] and r["comparisons"] == 1, (x, y, r["findings"])
 
 

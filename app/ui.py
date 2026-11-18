@@ -56,7 +56,7 @@ REASON = {
     "UNMATCHED_RECORD": "Appears in only one document", "UNSUPPORTED_UNIT": "Unit is not supported",
     "LINE_TOO_LONG": "Line is too long to read", "DIMENSION_MISMATCH": "Different physical dimensions",
     "AMBIGUOUS_COMPARISON": "One file gives several values", "DUPLICATE_IDENTIFIER": "Repeated with different values",
-    "TEMPERATURE_SEMANTICS": "Temperature difference against an absolute temperature",
+    "TEMPERATURE_SEMANTICS": "Temperature kind is not clear or not the same",
 }
 READ_AS = {".md": "Markdown", ".txt": "plain text", ".csv": "CSV", ".pdf": "text-based PDF"}
 # Upload policy (app/upload_policy.py). Read on every script run. PDF is off unless SPECFORGE_ENABLE_LOCAL_PDF_UI=1.
@@ -196,9 +196,13 @@ with st.container(horizontal=True, vertical_alignment="bottom", gap="small", key
             "**Units with more than one meaning are not guessed.** `ton`, `gallon`, `quart`, `pint`, `cal`, `hp`, `Btu` and `bbl` (barrel) "
             "are refused. Write an explicit unit, for example `short_ton`, `long_ton`, `tonne`, `US_liquid_gallon`, "
             "`imperial_gallon`, `thermochemical_calorie`, `metric_horsepower`, `oil_barrel`.\n\n"
-            "**Temperature differences are not absolute temperatures.** `delta_degC` is a difference. A property named "
-            "“temperature difference”, “rise”, “drop” or “delta T” makes `K` and `degC` a difference too. "
-            "A difference and an absolute temperature are never compared.\n\n"
+            "**Temperatures need a clear kind.** `delta_degC` and `delta_degF` are differences. A property named "
+            "“temperature difference”, “rise”, “drop” or “delta T” makes `K` and `degC` a difference too. A property named "
+            "“temperature” or “temp” makes them an absolute temperature. A difference and an absolute temperature are never compared. "
+            "A `degC` or `degF` value with an unclear name (for example “DT”, “diff”, “superheat”, “range” or no label) is not compared "
+            "with a different value, because the conversion depends on the kind.\n\n"
+            "**Unit text** is limited to simple units: at most 64 characters, 8 terms, `*` and `/`, and one short exponent per term "
+            "(`m^2`, `m**2`, `m²`, `s^-1`). Chained exponents and other expressions are not read and are listed as an unsupported unit.\n\n"
             "SpecForge shows where two documents disagree. It does not decide which one is right "
             "and it does not certify a document."
         )

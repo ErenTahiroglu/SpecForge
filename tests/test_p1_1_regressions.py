@@ -281,7 +281,7 @@ def T(a, b, field="temperature", fa=None, fb=None, tol=1e-6):
     return A({"a.md": f"T-1 | {fa or field} | {a}", "b.md": f"T-1 | {fb or field} | {b}"}, tol)
 
 
-@pytest.mark.parametrize("field", ["temperature difference", "delta T", "temperature rise", "temperature drop", "dT"])
+@pytest.mark.parametrize("field", ["temperature difference", "delta T", "temperature rise", "temperature drop"])   # "dT" is no longer a clear label (#47)
 def test_d05_interval_equivalence_is_preserved_when_the_property_says_difference(field):
     r = T("5 delta_degC", "5 K", field)
     assert r["status"] == "NO_DIFFERENCES_FOUND" and len(r["matches"]) == 1 and not r["warnings"]
@@ -308,7 +308,8 @@ def test_d05_unknown_semantics_is_reported_not_guessed():
 def test_d05_absolute_temperature_behaviour_is_unchanged():
     assert T("20 degC", "293.15 K")["status"] == "NO_DIFFERENCES_FOUND"
     assert T("20 degC", "20 K")["status"] == "DIFFERENCES"
-    assert T("20 degC", "293.15 K", "reading")["status"] == "NO_DIFFERENCES_FOUND"          # degC is absolute, K unknown: compared as absolute
+    r = T("20 degC", "293.15 K", "reading")                    # #47: an unlabelled degC is not assumed absolute any more
+    assert r["status"] == "NO_COMPARABLE_ROWS" and r["warnings"][0]["code"] == "TEMPERATURE_SEMANTICS" and r["warnings"][0]["detail"] == "unknown_kind"
     assert T("68 degF", "20 degC")["status"] == "NO_DIFFERENCES_FOUND"
 
 
