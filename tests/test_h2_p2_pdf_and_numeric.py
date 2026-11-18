@@ -531,7 +531,8 @@ def _page_text(at):
 
 
 @pytest.mark.parametrize("pages_a,pages_b", [(7, 6), (7, 7), (10, 3)])
-def test_ui_rejects_an_oversized_pdf_pair_with_a_clear_message(pages_a, pages_b):
+def test_ui_rejects_an_oversized_pdf_pair_with_a_clear_message(pages_a, pages_b, monkeypatch):
+    monkeypatch.setenv("SPECFORGE_ENABLE_LOCAL_PDF_UI", "1")                    # local opt-in: PDF is off by default
     at = _audit("a.pdf", pdf_pages(pages_a, "A"), "b.pdf", pdf_pages(pages_b, "B"))
     audit = at.session_state["audit"]
     assert audit["blocked"] is True
@@ -542,14 +543,16 @@ def test_ui_rejects_an_oversized_pdf_pair_with_a_clear_message(pages_a, pages_b)
 
 
 @pytest.mark.parametrize("pages_a,pages_b", [(6, 6), (10, 2)])
-def test_ui_accepts_a_pair_within_the_aggregate_limit(pages_a, pages_b):
+def test_ui_accepts_a_pair_within_the_aggregate_limit(pages_a, pages_b, monkeypatch):
+    monkeypatch.setenv("SPECFORGE_ENABLE_LOCAL_PDF_UI", "1")
     at = _audit("a.pdf", pdf_pages(pages_a, "A"), "b.pdf", pdf_pages(pages_b, "B"))
     audit = at.session_state["audit"]
     assert audit["blocked"] is False and audit["result"]["records"] == pages_a + pages_b
     _strict_loads(audit["json"])
 
 
-def test_ui_refuses_a_hostile_pdf_without_a_traceback():
+def test_ui_refuses_a_hostile_pdf_without_a_traceback(monkeypatch):
+    monkeypatch.setenv("SPECFORGE_ENABLE_LOCAL_PDF_UI", "1")
     bomb = build_pdf([[b" " * 50_000_000]], compress=True)
     at = _audit("bomb.pdf", bomb, "b.md", b"P-1 | pressure | 5 bar\n")
     audit = at.session_state["audit"]
