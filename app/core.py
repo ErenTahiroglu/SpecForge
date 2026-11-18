@@ -16,8 +16,10 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 import functools
+import json
 import math
 import re
+import sys
 from typing import Mapping
 import pint
 
@@ -63,6 +65,9 @@ AMBIGUOUS_UNITS = {
 _BARREL_WORD = re.compile(r"[a-zµμ]*(?:bbl|barrel)s?", re.IGNORECASE)
 _AMBIGUOUS_ALIASES = {"tons": "ton", "gal": "gallon", "gallons": "gallon", "quarts": "quart", "qt": "quart",
                       "pints": "pint", "pt": "pint", "calories": "calorie", "btus": "btu"}
+# Pint canonical names that the policy keys resolve to. Used only to fail closed when a prefix cannot be located.
+_AMBIGUOUS_CANONICAL = {"gallon": "gallon", "quart": "quart", "pint": "pint", "calorie": "calorie", "horsepower": "hp",
+                        "british_thermal_unit": "btu", "ton": "ton", "barrel": "barrel"}
 
 # --- D05: temperature differences are not absolute temperatures ---
 _INTERVAL_WORDS = {"delta", "difference", "differential", "diff", "rise", "drop", "interval", "dt"}
@@ -70,6 +75,7 @@ _ABSOLUTE_WORDS = {"temperature", "temp"}
 _OFFSET_TO_DELTA = {"degree_Celsius": "delta_degC", "degree_Fahrenheit": "delta_degF"}
 MAX_CHARS = 200_000
 MAX_LINES = 5_000
+MAX_DOCUMENTS = 12   # engine limit: audit_documents and the API accept 1..12 documents (a PDF page is one document)
 # Ingress guard (public hosting). The row regular expressions below are not linear-time on long runs of whitespace
 # (measured on the frozen baseline: one line of ~100,000 spaces took ~42 s, growth ~quadratic). Blank and delimiter-free
 # lines therefore skip every regular expression, and a delimiter-bearing line longer than this is not inspected: it is
@@ -77,6 +83,14 @@ MAX_LINES = 5_000
 # applied per line, so the worst case for one document stays bounded (about MAX_CHARS * MAX_LINE_CHARS steps).
 MAX_LINE_CHARS = 2_000
 _EXCERPT_CHARS = 200
+# H2-004 numeric policy (documented in the README). Two values are equal when their relative difference
+# |a-b| / max(|a|,|b|) is not above max(tolerance, ZERO_TOLERANCE_FLOOR). The floor exists because converted values carry
+# binary floating-point rounding: 12 L/min and 0.0002 m^3/s differ by about 2e-16 after conversion to SI. A conversion chain
+# is a few float multiplications, each with a relative error of at most 2**-53 (1.1e-16), so real conversions stay below
+# about 1e-14 (checked by tests over the supported unit pairs). 1e-12 leaves a margin of about 100. This is NOT exact
+# equality at tolerance 0: relative differences up to 1e-12 are treated as equal. effective_tolerance = max(tolerance, 1e-12).
+ZERO_TOLERANCE_FLOOR = 1e-12
+_TINY = sys.float_info.min   # smallest normal double; a nonzero value below this has lost precision and is not compared
 SCOPE = "Structured rows only; not a general PDF/P&ID semantic audit"
 
 
@@ -99,6 +113,30 @@ class Observation:
     def dimensionality(self):
         """Actual Pint structure; property stays out of dataclass/JSON serialization."""
         return UNITS.Quantity(1, ALIASES.get(self.unit, self.unit)).dimensionality
+
+
+class NumericRangeError(ValueError, ArithmeticError):
+    """A value is too large, too small or too imprecise to compare safely. The row is reported, never compared."""
+
+
+def relative_difference(a: float, b: float) -> float:
+    """|a-b| / max(|a|,|b|) without overflow or underflow of the intermediate results. Inputs must be finite.
+
+    Both values are first divided by the larger magnitude, so every intermediate is within [-1, 1]. The result is in
+    [0, 2]: 0 for equal values (including 0 and 0), 1 for a zero against a nonzero value and 2 for opposite signs.
+    """
+    if not (math.isfinite(a) and math.isfinite(b)):
+        raise NumericRangeError("non-finite value")
+    scale = max(abs(a), abs(b))
+    if scale == 0.0:
+        return 0.0
+    return abs(a / scale - b / scale)
+
+
+def reported_difference(error: float) -> float:
+    """The relative difference as reported: 10 decimals as before, but never 0.0 for a difference that was flagged."""
+    shown = round(error, 10)
+    return shown if shown > 0.0 or error == 0.0 else float(f"{error:.6g}")
 
 
 def dimension_key(dimensionality) -> str:
@@ -296,8 +334,40 @@ def _looks_like_row(raw: str, csv_file: bool) -> bool:
     return _looks_like_three_cell_row(raw, csv_file) or _looks_like_unsupported_layout(raw, csv_file)
 
 
+def _written_stems(word: str, candidates):
+    """H2-002. For every way Pint reads `word` (prefix, unit, suffix), yield the unit stem AS WRITTEN in the text.
+
+    Pint folds explicit names into the same canonical unit as the bare ambiguous name (`US_liquid_gallon` -> `gallon`,
+    `thermochemical_calorie` -> `calorie`, `short_ton` -> `ton`), so the canonical name cannot decide ambiguity. The
+    written stem can: `kgal` -> `gal`, `kilocalorie` -> `calorie`, `US_liquid_gallon` -> `US_liquid_gallon`.
+    Yields (canonical, stem); stem is None when the written prefix cannot be located, and the caller then fails closed."""
+    low = word.lower()
+    for prefix, canonical, suffix in candidates:
+        end = len(word) - len(suffix) if suffix and low.endswith(suffix.lower()) else len(word)
+        if not prefix:
+            yield canonical, word[:end]
+            continue
+        definition = UNITS._prefixes.get(prefix)
+        forms = {prefix, getattr(definition, "symbol", "") or "", *(getattr(definition, "aliases", ()) or ())}
+        written = next((f for f in sorted(filter(None, forms), key=len, reverse=True) if low.startswith(f.lower())), None)
+        yield canonical, (None if written is None else word[len(written):end])
+
+
+def _policy_key(stem: str) -> str:
+    """Policy name of a written stem; a plural `s` that Pint did not report as a suffix (`kgals`) is removed too."""
+    key = stem.lower()
+    key = _AMBIGUOUS_ALIASES.get(key, key)
+    if key not in AMBIGUOUS_UNITS and key.endswith("s"):
+        key = _AMBIGUOUS_ALIASES.get(key[:-1], key[:-1])
+    return key
+
+
 def ambiguous_unit(unit: str):
-    """Return (ambiguous_name, alternatives) when the unit text uses a regional or field-dependent name, else None."""
+    """Return (ambiguous_name, alternatives) when the unit text uses a regional or field-dependent name, else None.
+
+    A metric or binary prefix does not remove the ambiguity: `kgal`, `kcal`, `kBtu`, `kton` and `mhp` are refused like
+    `gal`, `cal`, `Btu`, `ton` and `hp` (H2-002). Explicit names (`US_liquid_gallon`, `international_calorie`,
+    `metric_horsepower`, `short_ton`, ...) stay usable."""
     for word in re.findall(r"[^\W\d]+", unit):             # `short_ton` is one name; it is not the word `ton`
         key = word.lower()
         # Ask Pint about every whole token, including all installed SI/binary prefixes.
@@ -309,6 +379,11 @@ def ambiguous_unit(unit: str):
         key = "barrel" if barrel else _AMBIGUOUS_ALIASES.get(key, key)
         if key in AMBIGUOUS_UNITS:
             return word, AMBIGUOUS_UNITS[key]
+        for canonical, stem in _written_stems(word, candidates):
+            # Prefix not located in the text: never guess. Refuse if the unit could be one of the ambiguous families.
+            key = _AMBIGUOUS_CANONICAL.get(canonical) if stem is None else _policy_key(stem)
+            if key in AMBIGUOUS_UNITS:
+                return word, AMBIGUOUS_UNITS[key]
     return None
 
 
@@ -370,6 +445,12 @@ def _parse(name: str, text: str):
             continue
         tag, field = match["tag"], match["field"].strip()
         value, unit = float(match["value"]), match["unit"]
+        if value == 0.0 and any(ch in "123456789" for ch in match["value"]):
+            value_error = NumericRangeError("a nonzero number is too small to represent")
+        elif not math.isfinite(value):
+            value_error = NumericRangeError("a number is too large to represent")
+        else:
+            value_error = None
         ambiguous = ambiguous_unit(unit)
         if ambiguous:
             word, alternatives = ambiguous
@@ -381,6 +462,8 @@ def _parse(name: str, text: str):
             })
             continue
         try:
+            if value_error:
+                raise value_error
             quantity = UNITS.Quantity(value, ALIASES.get(unit, unit))
             kind = ""
             if str(quantity.dimensionality) == "[temperature]":
@@ -391,7 +474,11 @@ def _parse(name: str, text: str):
             base = quantity.to_base_units()
             numeric = float(base.magnitude)
             if not math.isfinite(numeric):
-                raise ValueError("non-finite converted value")
+                raise NumericRangeError("non-finite converted value")
+            if 0.0 < abs(numeric) < _TINY:
+                raise NumericRangeError("converted value loses precision (subnormal)")
+            if numeric == 0.0 and value != 0.0 and float(UNITS.Quantity(value * 2, quantity.units).to_base_units().magnitude) == 0.0:
+                raise NumericRangeError("converted value underflows to zero")   # not a legitimate zero such as -273.15 degC
             dimension, base_units = str(quantity.dimensionality), str(base.units)
             key = dimension_key(quantity.dimensionality)
         except Exception as exc:  # any parser/conversion failure means: unit not usable, never a pass
@@ -474,8 +561,8 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
     """
     if not (0 <= tolerance <= 0.2) or not math.isfinite(tolerance):
         raise ValueError("tolerance must be between 0 and 0.2")
-    if not documents or len(documents) > 12:
-        raise ValueError("submit 1..12 documents")
+    if not documents or len(documents) > MAX_DOCUMENTS:
+        raise ValueError(f"submit 1..{MAX_DOCUMENTS} documents")
     all_records: list[Observation] = []
     warnings: list[dict] = []
     coverage: dict[str, dict] = {}
@@ -495,9 +582,10 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
     group_warnings: list[dict] = []
     comparisons = 0
 
+    allowed = max(tolerance, ZERO_TOLERANCE_FLOOR)
+
     def relative_error(a: Observation, b: Observation) -> float:
-        denominator = max(abs(a.si_value), abs(b.si_value))
-        return abs(a.si_value - b.si_value) / denominator if denominator else 0.0
+        return relative_difference(a.si_value, b.si_value)
 
     for (tag, field), records in sorted(groups.items()):
         by_source: dict[str, list[Observation]] = defaultdict(list)
@@ -516,11 +604,20 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
                     group_warnings.append({"code": "DIMENSION_MISMATCH", "tag": tag, "field": field,
                                            "reference": asdict(first), "other": asdict(other)})
                     continue
+                # H2-001: a temperature difference and an absolute temperature are never "the same value", even when
+                # their kelvin numbers agree. Check the kind BEFORE the numbers, so that no row can represent the source.
+                problem = _temperature_pair(first, other)
+                if problem:
+                    consistent = False
+                    group_warnings.append({"code": "TEMPERATURE_SEMANTICS", "scope": "same_source", "detail": problem[0],
+                                           "message": problem[1], "tag": tag, "field": field,
+                                           "reference": asdict(first), "other": asdict(other)})
+                    continue
                 error = relative_error(first, other)
-                if error > tolerance:
+                if error > allowed:
                     consistent = False
                     findings.append({"code": "INTERNAL_CONTRADICTION", "scope": "same_source", "tag": tag, "field": field,
-                                     "relative_difference": round(error, 10),
+                                     "relative_difference": reported_difference(error),
                                      "reference": asdict(first), "other": asdict(other)})
             group_warnings.append({
                 "code": "DUPLICATE_IDENTIFIER", "document": source, "tag": same[0].tag, "field": same[0].field,
@@ -556,9 +653,9 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
                 continue
             comparisons += 1
             error = relative_error(reference, other)
-            item = {"scope": "cross_source", "tag": tag, "field": field, "relative_difference": round(error, 10),
+            item = {"scope": "cross_source", "tag": tag, "field": field, "relative_difference": reported_difference(error),
                     "reference": asdict(reference), "other": asdict(other)}
-            if error > tolerance:
+            if error > allowed:
                 findings.append({"code": "VALUE_MISMATCH", **item})
             else:
                 matches.append({"code": "WITHIN_TOLERANCE", **item})
@@ -571,4 +668,8 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
         "scope": SCOPE,
     }
     result["verdict"], result["coverage_complete"] = audit_verdict(result)
+    try:
+        json.dumps(result, allow_nan=False)      # H2-004: a result that standard JSON cannot carry is an error, never output
+    except ValueError as exc:
+        raise NumericRangeError("NUMERIC_RANGE: the result contains a non-finite number and was not produced") from exc
     return result
