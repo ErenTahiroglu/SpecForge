@@ -87,8 +87,8 @@ _EXCERPT_CHARS = 200
 # |a-b| / max(|a|,|b|) is not above max(tolerance, ZERO_TOLERANCE_FLOOR). The floor exists because converted values carry
 # binary floating-point rounding: 12 L/min and 0.0002 m^3/s differ by about 2e-16 after conversion to SI. A conversion chain
 # is a few float multiplications, each with a relative error of at most 2**-53 (1.1e-16), so real conversions stay below
-# about 1e-14 (checked by tests over the supported unit pairs). 1e-12 leaves a margin of about 100 and is still 10**7 times
-# smaller than the smallest user tolerance step (0.01 %), so it hides no engineering difference.
+# about 1e-14 (checked by tests over the supported unit pairs). 1e-12 leaves a margin of about 100. This is NOT exact
+# equality at tolerance 0: relative differences up to 1e-12 are treated as equal. effective_tolerance = max(tolerance, 1e-12).
 ZERO_TOLERANCE_FLOOR = 1e-12
 _TINY = sys.float_info.min   # smallest normal double; a nonzero value below this has lost precision and is not compared
 SCOPE = "Structured rows only; not a general PDF/P&ID semantic audit"
