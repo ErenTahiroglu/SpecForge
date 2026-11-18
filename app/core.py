@@ -63,6 +63,9 @@ AMBIGUOUS_UNITS = {
 _BARREL_WORD = re.compile(r"[a-zµμ]*(?:bbl|barrel)s?", re.IGNORECASE)
 _AMBIGUOUS_ALIASES = {"tons": "ton", "gal": "gallon", "gallons": "gallon", "quarts": "quart", "qt": "quart",
                       "pints": "pint", "pt": "pint", "calories": "calorie", "btus": "btu"}
+# Pint canonical names that the policy keys resolve to. Used only to fail closed when a prefix cannot be located.
+_AMBIGUOUS_CANONICAL = {"gallon": "gallon", "quart": "quart", "pint": "pint", "calorie": "calorie", "horsepower": "hp",
+                        "british_thermal_unit": "btu", "ton": "ton", "barrel": "barrel"}
 
 # --- D05: temperature differences are not absolute temperatures ---
 _INTERVAL_WORDS = {"delta", "difference", "differential", "diff", "rise", "drop", "interval", "dt"}
@@ -296,8 +299,40 @@ def _looks_like_row(raw: str, csv_file: bool) -> bool:
     return _looks_like_three_cell_row(raw, csv_file) or _looks_like_unsupported_layout(raw, csv_file)
 
 
+def _written_stems(word: str, candidates):
+    """H2-002. For every way Pint reads `word` (prefix, unit, suffix), yield the unit stem AS WRITTEN in the text.
+
+    Pint folds explicit names into the same canonical unit as the bare ambiguous name (`US_liquid_gallon` -> `gallon`,
+    `thermochemical_calorie` -> `calorie`, `short_ton` -> `ton`), so the canonical name cannot decide ambiguity. The
+    written stem can: `kgal` -> `gal`, `kilocalorie` -> `calorie`, `US_liquid_gallon` -> `US_liquid_gallon`.
+    Yields (canonical, stem); stem is None when the written prefix cannot be located, and the caller then fails closed."""
+    low = word.lower()
+    for prefix, canonical, suffix in candidates:
+        end = len(word) - len(suffix) if suffix and low.endswith(suffix.lower()) else len(word)
+        if not prefix:
+            yield canonical, word[:end]
+            continue
+        definition = UNITS._prefixes.get(prefix)
+        forms = {prefix, getattr(definition, "symbol", "") or "", *(getattr(definition, "aliases", ()) or ())}
+        written = next((f for f in sorted(filter(None, forms), key=len, reverse=True) if low.startswith(f.lower())), None)
+        yield canonical, (None if written is None else word[len(written):end])
+
+
+def _policy_key(stem: str) -> str:
+    """Policy name of a written stem; a plural `s` that Pint did not report as a suffix (`kgals`) is removed too."""
+    key = stem.lower()
+    key = _AMBIGUOUS_ALIASES.get(key, key)
+    if key not in AMBIGUOUS_UNITS and key.endswith("s"):
+        key = _AMBIGUOUS_ALIASES.get(key[:-1], key[:-1])
+    return key
+
+
 def ambiguous_unit(unit: str):
-    """Return (ambiguous_name, alternatives) when the unit text uses a regional or field-dependent name, else None."""
+    """Return (ambiguous_name, alternatives) when the unit text uses a regional or field-dependent name, else None.
+
+    A metric or binary prefix does not remove the ambiguity: `kgal`, `kcal`, `kBtu`, `kton` and `mhp` are refused like
+    `gal`, `cal`, `Btu`, `ton` and `hp` (H2-002). Explicit names (`US_liquid_gallon`, `international_calorie`,
+    `metric_horsepower`, `short_ton`, ...) stay usable."""
     for word in re.findall(r"[^\W\d]+", unit):             # `short_ton` is one name; it is not the word `ton`
         key = word.lower()
         # Ask Pint about every whole token, including all installed SI/binary prefixes.
@@ -309,6 +344,11 @@ def ambiguous_unit(unit: str):
         key = "barrel" if barrel else _AMBIGUOUS_ALIASES.get(key, key)
         if key in AMBIGUOUS_UNITS:
             return word, AMBIGUOUS_UNITS[key]
+        for canonical, stem in _written_stems(word, candidates):
+            # Prefix not located in the text: never guess. Refuse if the unit could be one of the ambiguous families.
+            key = _AMBIGUOUS_CANONICAL.get(canonical) if stem is None else _policy_key(stem)
+            if key in AMBIGUOUS_UNITS:
+                return word, AMBIGUOUS_UNITS[key]
     return None
 
 
@@ -514,6 +554,15 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
                 if first.dimensionality != other.dimensionality:
                     consistent = False
                     group_warnings.append({"code": "DIMENSION_MISMATCH", "tag": tag, "field": field,
+                                           "reference": asdict(first), "other": asdict(other)})
+                    continue
+                # H2-001: a temperature difference and an absolute temperature are never "the same value", even when
+                # their kelvin numbers agree. Check the kind BEFORE the numbers, so that no row can represent the source.
+                problem = _temperature_pair(first, other)
+                if problem:
+                    consistent = False
+                    group_warnings.append({"code": "TEMPERATURE_SEMANTICS", "scope": "same_source", "detail": problem[0],
+                                           "message": problem[1], "tag": tag, "field": field,
                                            "reference": asdict(first), "other": asdict(other)})
                     continue
                 error = relative_error(first, other)
