@@ -24,7 +24,7 @@ import streamlit as st  # noqa: E402
 
 from app.core import audit_documents, audit_verdict  # noqa: E402
 from app.ingest import (  # noqa: E402
-    SUPPORTED_EXTENSIONS, SUPPORTED_FORMATS_TEXT, ingest_upload, input_fingerprint, split_document_name, unique_names,
+    SUPPORTED_EXTENSIONS, SUPPORTED_FORMATS_TEXT, ingest_pair, input_fingerprint, split_document_name, unique_names,
 )
 from app.report import VERDICT_CONFLICTS, VERDICT_MATCH, VERDICT_NONE, build_view, escape_md, render_markdown  # noqa: E402
 
@@ -277,7 +277,7 @@ def _run_audit():
     ss["audit_count"] = ss.get("audit_count", 0) + 1    # how many times the engine ran in this session (tests read it)
     (_, name_a, data_a), (_, name_b, data_b) = _load_inputs()
     key_a, key_b = unique_names(name_a, name_b)
-    res_a, res_b = ingest_upload(key_a, data_a), ingest_upload(key_b, data_b)
+    res_a, res_b = ingest_pair(key_a, data_a, key_b, data_b)
     issues = res_a.issues + res_b.issues
     files = [f"Document A: {key_a}", f"Document B: {key_b}"]
     if not res_a.documents or not res_b.documents:
@@ -296,7 +296,7 @@ def _run_audit():
         "blocked": False, "view": view, "result": result, "names": (key_a, key_b),
         "markdown": render_markdown(view, stamp),
         "json": json.dumps({"verdict": verdict, "coverage_complete": coverage_complete,
-                            "result": result, "input_issues": issues}, indent=2, ensure_ascii=False),
+                            "result": result, "input_issues": issues}, indent=2, ensure_ascii=False, allow_nan=False),
         "input_key": _current_key(),
     }
 

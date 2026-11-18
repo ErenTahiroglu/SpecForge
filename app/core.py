@@ -16,8 +16,10 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 import functools
+import json
 import math
 import re
+import sys
 from typing import Mapping
 import pint
 
@@ -73,6 +75,7 @@ _ABSOLUTE_WORDS = {"temperature", "temp"}
 _OFFSET_TO_DELTA = {"degree_Celsius": "delta_degC", "degree_Fahrenheit": "delta_degF"}
 MAX_CHARS = 200_000
 MAX_LINES = 5_000
+MAX_DOCUMENTS = 12   # engine limit: audit_documents and the API accept 1..12 documents (a PDF page is one document)
 # Ingress guard (public hosting). The row regular expressions below are not linear-time on long runs of whitespace
 # (measured on the frozen baseline: one line of ~100,000 spaces took ~42 s, growth ~quadratic). Blank and delimiter-free
 # lines therefore skip every regular expression, and a delimiter-bearing line longer than this is not inspected: it is
@@ -80,6 +83,14 @@ MAX_LINES = 5_000
 # applied per line, so the worst case for one document stays bounded (about MAX_CHARS * MAX_LINE_CHARS steps).
 MAX_LINE_CHARS = 2_000
 _EXCERPT_CHARS = 200
+# H2-004 numeric policy (documented in the README). Two values are equal when their relative difference
+# |a-b| / max(|a|,|b|) is not above max(tolerance, ZERO_TOLERANCE_FLOOR). The floor exists because converted values carry
+# binary floating-point rounding: 12 L/min and 0.0002 m^3/s differ by about 2e-16 after conversion to SI. A conversion chain
+# is a few float multiplications, each with a relative error of at most 2**-53 (1.1e-16), so real conversions stay below
+# about 1e-14 (checked by tests over the supported unit pairs). 1e-12 leaves a margin of about 100. This is NOT exact
+# equality at tolerance 0: relative differences up to 1e-12 are treated as equal. effective_tolerance = max(tolerance, 1e-12).
+ZERO_TOLERANCE_FLOOR = 1e-12
+_TINY = sys.float_info.min   # smallest normal double; a nonzero value below this has lost precision and is not compared
 SCOPE = "Structured rows only; not a general PDF/P&ID semantic audit"
 
 
@@ -102,6 +113,30 @@ class Observation:
     def dimensionality(self):
         """Actual Pint structure; property stays out of dataclass/JSON serialization."""
         return UNITS.Quantity(1, ALIASES.get(self.unit, self.unit)).dimensionality
+
+
+class NumericRangeError(ValueError, ArithmeticError):
+    """A value is too large, too small or too imprecise to compare safely. The row is reported, never compared."""
+
+
+def relative_difference(a: float, b: float) -> float:
+    """|a-b| / max(|a|,|b|) without overflow or underflow of the intermediate results. Inputs must be finite.
+
+    Both values are first divided by the larger magnitude, so every intermediate is within [-1, 1]. The result is in
+    [0, 2]: 0 for equal values (including 0 and 0), 1 for a zero against a nonzero value and 2 for opposite signs.
+    """
+    if not (math.isfinite(a) and math.isfinite(b)):
+        raise NumericRangeError("non-finite value")
+    scale = max(abs(a), abs(b))
+    if scale == 0.0:
+        return 0.0
+    return abs(a / scale - b / scale)
+
+
+def reported_difference(error: float) -> float:
+    """The relative difference as reported: 10 decimals as before, but never 0.0 for a difference that was flagged."""
+    shown = round(error, 10)
+    return shown if shown > 0.0 or error == 0.0 else float(f"{error:.6g}")
 
 
 def dimension_key(dimensionality) -> str:
@@ -410,6 +445,12 @@ def _parse(name: str, text: str):
             continue
         tag, field = match["tag"], match["field"].strip()
         value, unit = float(match["value"]), match["unit"]
+        if value == 0.0 and any(ch in "123456789" for ch in match["value"]):
+            value_error = NumericRangeError("a nonzero number is too small to represent")
+        elif not math.isfinite(value):
+            value_error = NumericRangeError("a number is too large to represent")
+        else:
+            value_error = None
         ambiguous = ambiguous_unit(unit)
         if ambiguous:
             word, alternatives = ambiguous
@@ -421,6 +462,8 @@ def _parse(name: str, text: str):
             })
             continue
         try:
+            if value_error:
+                raise value_error
             quantity = UNITS.Quantity(value, ALIASES.get(unit, unit))
             kind = ""
             if str(quantity.dimensionality) == "[temperature]":
@@ -431,7 +474,11 @@ def _parse(name: str, text: str):
             base = quantity.to_base_units()
             numeric = float(base.magnitude)
             if not math.isfinite(numeric):
-                raise ValueError("non-finite converted value")
+                raise NumericRangeError("non-finite converted value")
+            if 0.0 < abs(numeric) < _TINY:
+                raise NumericRangeError("converted value loses precision (subnormal)")
+            if numeric == 0.0 and value != 0.0 and float(UNITS.Quantity(value * 2, quantity.units).to_base_units().magnitude) == 0.0:
+                raise NumericRangeError("converted value underflows to zero")   # not a legitimate zero such as -273.15 degC
             dimension, base_units = str(quantity.dimensionality), str(base.units)
             key = dimension_key(quantity.dimensionality)
         except Exception as exc:  # any parser/conversion failure means: unit not usable, never a pass
@@ -514,8 +561,8 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
     """
     if not (0 <= tolerance <= 0.2) or not math.isfinite(tolerance):
         raise ValueError("tolerance must be between 0 and 0.2")
-    if not documents or len(documents) > 12:
-        raise ValueError("submit 1..12 documents")
+    if not documents or len(documents) > MAX_DOCUMENTS:
+        raise ValueError(f"submit 1..{MAX_DOCUMENTS} documents")
     all_records: list[Observation] = []
     warnings: list[dict] = []
     coverage: dict[str, dict] = {}
@@ -535,9 +582,10 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
     group_warnings: list[dict] = []
     comparisons = 0
 
+    allowed = max(tolerance, ZERO_TOLERANCE_FLOOR)
+
     def relative_error(a: Observation, b: Observation) -> float:
-        denominator = max(abs(a.si_value), abs(b.si_value))
-        return abs(a.si_value - b.si_value) / denominator if denominator else 0.0
+        return relative_difference(a.si_value, b.si_value)
 
     for (tag, field), records in sorted(groups.items()):
         by_source: dict[str, list[Observation]] = defaultdict(list)
@@ -566,10 +614,10 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
                                            "reference": asdict(first), "other": asdict(other)})
                     continue
                 error = relative_error(first, other)
-                if error > tolerance:
+                if error > allowed:
                     consistent = False
                     findings.append({"code": "INTERNAL_CONTRADICTION", "scope": "same_source", "tag": tag, "field": field,
-                                     "relative_difference": round(error, 10),
+                                     "relative_difference": reported_difference(error),
                                      "reference": asdict(first), "other": asdict(other)})
             group_warnings.append({
                 "code": "DUPLICATE_IDENTIFIER", "document": source, "tag": same[0].tag, "field": same[0].field,
@@ -605,9 +653,9 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
                 continue
             comparisons += 1
             error = relative_error(reference, other)
-            item = {"scope": "cross_source", "tag": tag, "field": field, "relative_difference": round(error, 10),
+            item = {"scope": "cross_source", "tag": tag, "field": field, "relative_difference": reported_difference(error),
                     "reference": asdict(reference), "other": asdict(other)}
-            if error > tolerance:
+            if error > allowed:
                 findings.append({"code": "VALUE_MISMATCH", **item})
             else:
                 matches.append({"code": "WITHIN_TOLERANCE", **item})
@@ -620,4 +668,8 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
         "scope": SCOPE,
     }
     result["verdict"], result["coverage_complete"] = audit_verdict(result)
+    try:
+        json.dumps(result, allow_nan=False)      # H2-004: a result that standard JSON cannot carry is an error, never output
+    except ValueError as exc:
+        raise NumericRangeError("NUMERIC_RANGE: the result contains a non-finite number and was not produced") from exc
     return result
