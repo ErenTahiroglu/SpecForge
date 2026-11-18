@@ -24,7 +24,10 @@ import streamlit as st  # noqa: E402
 
 from app.core import audit_documents, audit_verdict  # noqa: E402
 from app.ingest import (  # noqa: E402
-    SUPPORTED_EXTENSIONS, SUPPORTED_FORMATS_TEXT, ingest_pair, input_fingerprint, split_document_name, unique_names,
+    ingest_pair, input_fingerprint, split_document_name, unique_names,
+)
+from app.upload_policy import (  # noqa: E402
+    PDF_DISABLED_CODE, PDF_DISABLED_MESSAGE, is_pdf_name, pdf_ui_enabled, refused_pdf_names, ui_extensions, ui_formats_text,
 )
 from app.report import VERDICT_CONFLICTS, VERDICT_MATCH, VERDICT_NONE, build_view, escape_md, render_markdown  # noqa: E402
 
@@ -56,6 +59,9 @@ REASON = {
     "TEMPERATURE_SEMANTICS": "Temperature difference against an absolute temperature",
 }
 READ_AS = {".md": "Markdown", ".txt": "plain text", ".csv": "CSV", ".pdf": "text-based PDF"}
+# Upload policy (app/upload_policy.py). Read on every script run. PDF is off unless SPECFORGE_ENABLE_LOCAL_PDF_UI=1.
+PDF_UI = pdf_ui_enabled()
+UI_EXTENSIONS = ui_extensions(PDF_UI)
 
 st.set_page_config(page_title="SpecForge", page_icon="🔎", layout="wide")
 # Owned class names only. No Streamlit-internal element is restyled.
@@ -179,7 +185,7 @@ with st.container(horizontal=True, vertical_alignment="bottom", gap="small", key
                             help="Two converted values differ if |A − B| ÷ the larger of |A| and |B| is above this limit.")
     with st.popover("Formats & limits", key="limits_pop"):
         st.markdown(
-            f"**Supported files:** {SUPPORTED_FORMATS_TEXT}\n\n"
+            f"**Supported files:** {ui_formats_text(PDF_UI)}\n\n"
             "**Supported rows:** one measurement per line, in this form:\n\n"
             "`P-101 | pressure | 10 bar`  (Markdown table rows with outer pipes also work)\n\n"
             "In `.csv` files, rows like `P-101,pressure,10 bar` or `P-101,pressure,10,bar` also work.\n\n"
@@ -223,18 +229,24 @@ with st.container(key="inputs"):
     # The uploaders are always rendered (inside one keyed expander), so chosen files survive a switch to an example.
     with st.expander("My files" + (" (kept while an example is selected)" if use_example else ""),
                      expanded=not use_example, key="files_exp"):
-        _types = [e.lstrip(".") for e in SUPPORTED_EXTENSIONS]
+        _types = [e.lstrip(".") for e in UI_EXTENSIONS]
+        if not PDF_UI:
+            st.caption(PDF_DISABLED_MESSAGE)
         _col_a, _col_b = st.columns(2)
         for _col, _slot, _label in ((_col_a, "up_a", "Document A"), (_col_b, "up_b", "Document B")):
             with _col:
                 _up = st.file_uploader(_label, type=_types, key=_slot, on_change=_use_my_files, args=(_slot,))
                 if _up is not None:
                     _data = _up.getvalue()
-                    _ext = next((e for e in SUPPORTED_EXTENSIONS if _up.name.lower().endswith(e)), None)
-                    _kind = READ_AS[_ext] if _ext else "not a supported type (the audit will stop)"
+                    _ext = next((e for e in UI_EXTENSIONS if _up.name.lower().endswith(e)), None)
+                    _pdf_off = not PDF_UI and is_pdf_name(_up.name)
+                    _kind = (READ_AS[_ext] if _ext else "PDF, which is off in this web interface (the audit will stop)"
+                             if _pdf_off else "not a supported type (the audit will stop)")
                     # #31: a source-adjacent safe label. The upload box itself shows the raw name.
                     owned_html(f'<div class="sf-file">Selected for {_label}: <code><bdi>{esc(_up.name)}</bdi></code> · '
                                f'{len(_data):,} bytes · SHA-256 {hashlib.sha256(_data).hexdigest()[:12]} · read as {esc(_kind)}</div>')
+                    if _pdf_off:
+                        st.warning(f"**{_label} is a PDF.** {PDF_DISABLED_MESSAGE} Nothing from this pair will be audited.")
                     _found = bidi_in(_up.name)
                     if _found:
                         _what = ("**Rename this file to continue.** " if not use_example else
@@ -273,10 +285,25 @@ def _load_inputs():
     return [("A", up_a.name, up_a.getvalue()), ("B", up_b.name, up_b.getvalue())]
 
 
+def _pdf_gate(name_a, name_b, key_a, key_b):
+    """Server-side upload policy gate. Runs on the loaded names, before any reader is called, so it does not depend on
+    the upload control's type filter. A refused file in either slot refuses the whole pair: nothing is compared."""
+    issues = []
+    for label, name, key in (("Document A", name_a, key_a), ("Document B", name_b, key_b)):
+        if refused_pdf_names([name, key], PDF_UI):
+            issues.append({"code": PDF_DISABLED_CODE, "filename": key, "message": f"{label} ({name}) is a PDF. {PDF_DISABLED_MESSAGE}"})
+    return issues
+
+
 def _run_audit():
-    ss["audit_count"] = ss.get("audit_count", 0) + 1    # how many times the engine ran in this session (tests read it)
     (_, name_a, data_a), (_, name_b, data_b) = _load_inputs()
     key_a, key_b = unique_names(name_a, name_b)
+    refused = _pdf_gate(name_a, name_b, key_a, key_b)
+    if refused:                                         # never reaches ingest_pair, pdf_page_count or the PDF reader
+        ss["audit"] = {"blocked": True, "issues": refused, "files": [f"Document A: {key_a}", f"Document B: {key_b}"],
+                       "input_key": _current_key()}
+        return
+    ss["audit_count"] = ss.get("audit_count", 0) + 1    # how many times the engine ran in this session (tests read it)
     res_a, res_b = ingest_pair(key_a, data_a, key_b, data_b)
     issues = res_a.issues + res_b.issues
     files = [f"Document A: {key_a}", f"Document B: {key_b}"]

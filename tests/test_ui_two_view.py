@@ -434,7 +434,8 @@ def _mixed_pdf_audit():
     return at
 
 
-def test_r01_partial_pdf_issue_does_not_claim_the_whole_file_was_unread():
+def test_r01_partial_pdf_issue_does_not_claim_the_whole_file_was_unread(monkeypatch):
+    monkeypatch.setenv("SPECFORGE_ENABLE_LOCAL_PDF_UI", "1")                    # local opt-in: PDF is off by default
     at = _mixed_pdf_audit()
     audit = at.session_state["audit"]
     result = json.loads(audit["json"])
