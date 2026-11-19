@@ -14,7 +14,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .ingest import split_document_name
-from .core import UNITS, VERDICT_CONFLICTS, VERDICT_MATCH, VERDICT_NONE, VERDICT_PARTIAL, audit_verdict
+from .core import (UNITS, VERDICT_CONFLICTS, VERDICT_MATCH, VERDICT_NONE, VERDICT_PARTIAL, ZERO_TOLERANCE_FLOOR,
+                   audit_verdict)
 
 PRESSURE_DIMENSION = UNITS.pascal.dimensionality
 
@@ -93,6 +94,7 @@ class AuditView:
     scope: str = ""
     tolerance: float = 0.0
     coverage_complete: bool = False   # the authoritative flag (core.audit_verdict), including input issues
+    effective_tolerance: float = 0.0  # enforced allowed difference: max(requested tolerance, 1e-12); `tolerance` is the request
 
 
 # Pint's names for SI base-unit combinations -> the symbols engineers use.
@@ -115,6 +117,13 @@ def fmt_number(x: float) -> str:
 
 def fmt_pct(fraction: float) -> str:
     return format(fraction * 100, ".10g") + " %"
+
+
+def allowed_text(requested: float, effective: float) -> str:
+    """The allowed difference as enforced. When the numeric floor (1e-12 relative) raised the request, both are shown."""
+    if effective == requested:
+        return fmt_pct(effective)
+    return f"{fmt_pct(effective)} (requested {fmt_pct(requested)}; values are never compared more finely than 1e-12)"
 
 
 def describe_location(name: str, line: int) -> str:
@@ -150,7 +159,7 @@ def _label_of(rec: dict, labels: dict) -> str:
     return _doc_label(rec["document"], labels)
 
 
-def _conflict_card(item: dict, labels: dict, tolerance: float) -> ReviewCard:
+def _conflict_card(item: dict, labels: dict, tolerance: float, requested: float) -> ReviewCard:
     ref, oth = item["reference"], item["other"]
     internal = item["code"] == "INTERNAL_CONTRADICTION"
     la, lb = _label_of(ref, labels), _label_of(oth, labels)
@@ -165,7 +174,7 @@ def _conflict_card(item: dict, labels: dict, tolerance: float) -> ReviewCard:
         f"{where} The first row states {_quantity(ref)}. The second row states {_quantity(oth)}. "
         f"Converted to SI ({si_symbol(ref['si_unit'])}): {_si(ref)} and {_si(oth)}. "
         f"The second value is {lower} by {fmt_pct(item['relative_difference'])} "
-        f"(difference divided by the larger value). The allowed difference is {fmt_pct(tolerance)}. "
+        f"(difference divided by the larger value). The allowed difference is {allowed_text(requested, tolerance)}. "
         "SpecForge cannot tell which value is correct."
     )
     if internal:
@@ -177,15 +186,18 @@ def _conflict_card(item: dict, labels: dict, tolerance: float) -> ReviewCard:
         issue, explanation, difference=fmt_pct(item["relative_difference"]))
 
 
-def _equivalent_card(item: dict, labels: dict, tolerance: float) -> ReviewCard:
+def _equivalent_card(item: dict, labels: dict, tolerance: float, requested: float) -> ReviewCard:
     ref, oth = item["reference"], item["other"]
     explanation = (
         f"{_quantity(ref)} and {_quantity(oth)} convert to {_si(ref)} and {_si(oth)}. "
-        f"The difference is {fmt_pct(item['relative_difference'])}, within the allowed {fmt_pct(tolerance)}."
+        f"The difference is {fmt_pct(item['relative_difference'])}, within the allowed {allowed_text(requested, tolerance)}."
     )
+    same = f"{_quantity(ref)} = {_quantity(oth)}"
+    if item["relative_difference"] > ZERO_TOLERANCE_FLOOR:      # more than rounding noise: not the same value, only within tolerance
+        same = f"{_quantity(ref)} \u2248 {_quantity(oth)} (within tolerance, difference {fmt_pct(item['relative_difference'])})"
     return ReviewCard("equivalent", _title(item), [_evidence(_label_of(ref, labels), ref), _evidence(_label_of(oth, labels), oth)],
                       "No difference beyond the tolerance", explanation, difference=fmt_pct(item["relative_difference"]),
-                      summary=f"{_quantity(ref)} = {_quantity(oth)}")
+                      summary=same)
 
 
 def _plural_lines(w: dict) -> str:
@@ -237,10 +249,11 @@ def build_view(result: dict, labels: Optional[dict] = None, input_issues: Option
                files: Optional[list] = None) -> AuditView:
     labels = labels or {}
     input_issues = list(input_issues or [])
-    tol = result["tolerance"]
+    requested = result["tolerance"]
+    tol = result.get("effective_tolerance", max(requested, ZERO_TOLERANCE_FLOOR))
     coverage, notes = _coverage_items(result)
-    conflicts = [_conflict_card(f, labels, tol) for f in result["findings"]]
-    equivalents = [_equivalent_card(m, labels, tol) for m in result["matches"]]
+    conflicts = [_conflict_card(f, labels, tol, requested) for f in result["findings"]]
+    equivalents = [_equivalent_card(m, labels, tol, requested) for m in result["matches"]]
     gaps = len(coverage) + len(input_issues)
     n_conf, n_comp = len(conflicts), result["comparisons"]
     metrics = {
@@ -269,7 +282,7 @@ def build_view(result: dict, labels: Optional[dict] = None, input_issues: Option
         headline = f"No conflicts in the {n_comp} compared measurement{'s' if n_comp != 1 else ''}"
         detail = "This covers only rows in the supported format. It is not a certification of the documents."
     return AuditView(verdict, headline, detail, metrics, conflicts, equivalents, coverage, notes, internal, input_issues,
-                     list(files or []), result["scope"], tol, complete)
+                     list(files or []), result["scope"], requested, complete, tol)
 
 
 def _where(ev) -> str:
@@ -312,7 +325,11 @@ def render_markdown(view: AuditView, generated_at: Optional[str] = None) -> str:
                        ("conflicts", "Conflicts"), ("equivalent", "Equivalent after conversion"),
                        ("not_compared", "Items not compared")):
         out.append(f"| {label} | {view.metrics[key]} |")
-    out += ["", f"Allowed difference: {fmt_pct(view.tolerance)}.", ""]
+    if view.effective_tolerance == view.tolerance:
+        out += ["", f"Allowed difference: {fmt_pct(view.tolerance)}.", ""]
+    else:
+        out += ["", f"Allowed difference: requested {fmt_pct(view.tolerance)}, enforced {fmt_pct(view.effective_tolerance)} "
+                    "(values are never compared more finely than 1e-12 relative).", ""]
     out += ["## Conflicts", ""]
     if not view.conflicts:
         out += ["None found among the compared measurements.", ""]

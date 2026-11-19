@@ -16,6 +16,7 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 import functools
+import itertools
 import json
 import math
 import re
@@ -70,12 +71,17 @@ _AMBIGUOUS_CANONICAL = {"gallon": "gallon", "quart": "quart", "pint": "pint", "c
                         "british_thermal_unit": "btu", "ton": "ton", "barrel": "barrel"}
 
 # --- D05: temperature differences are not absolute temperatures ---
-# FR-03 (#47): only these words make a property name a clear label. Abbreviations (DT, diff, dTemp) and domain terms
-# (superheat, approach, range ...) do not: their meaning depends on the document, so the kind stays "unknown".
-_INTERVAL_WORDS = {"delta", "difference", "differential", "rise", "drop", "interval"}
-_ABSOLUTE_WORDS = {"temperature", "temp"}
-_UNCLEAR_TEMPERATURE_WORDS = {"dt", "dtemp", "dtemperature", "dtmp", "diff", "superheat", "superheating", "subcool",
-                              "subcooling", "subcooled", "approach", "range", "span", "spread", "margin"}
+# FINAL-RT-003 (#53): the kind of a temperature comes from a finite label grammar, never from one word somewhere in a longer name.
+#   absolute label: every word is `temperature`/`temp` or a listed qualifier, and at least one is `temperature`/`temp`
+#   interval label: every word is `temperature`/`temp`/`t`/`delta`, a qualifier or a difference word, and at least one is a
+#                   difference word (difference, differential, rise, drop, delta, interval)
+#   anything else (uncertainty, deviation, margin, error, superheat, DT, diff, "of", unknown words ...) is UNKNOWN.
+# A delta_ unit decides the kind by itself. An unknown kind is not compared when an offset unit (degC, degF) is involved.
+_TEMPERATURE_NOUNS = frozenset({"temperature", "temp"})
+_INTERVAL_HEADS = frozenset({"delta", "difference", "differential", "rise", "drop", "interval"})
+_TEMPERATURE_QUALIFIERS = frozenset({
+    "design", "operating", "operation", "ambient", "maximum", "max", "minimum", "min", "normal", "nominal", "rated", "working",
+    "process", "inlet", "outlet", "supply", "return", "setpoint", "set", "point", "storage", "test", "service"})
 _OFFSET_TO_DELTA = {"degree_Celsius": "delta_degC", "degree_Fahrenheit": "delta_degF"}
 MAX_CHARS = 200_000
 MAX_LINES = 5_000
@@ -218,15 +224,20 @@ class NumericRangeError(ValueError, ArithmeticError):
 def relative_difference(a: float, b: float) -> float:
     """|a-b| / max(|a|,|b|) without overflow or underflow of the intermediate results. Inputs must be finite.
 
-    Both values are first divided by the larger magnitude, so every intermediate is within [-1, 1]. The result is in
-    [0, 2]: 0 for equal values (including 0 and 0), 1 for a zero against a nonzero value and 2 for opposite signs.
+    Same-sign values: |a - b| / max(|a|, |b|). Otherwise both values are first divided by the larger magnitude, so every
+    intermediate is within [-1, 1]. The result is in [0, 2]: 0 for equal values (including 0 and 0), 1 for a zero against a
+    nonzero value and 2 for opposite signs. Tested against an exact rational oracle (tests/test_final_rt_numeric_boundary.py).
     """
     if not (math.isfinite(a) and math.isfinite(b)):
         raise NumericRangeError("non-finite value")
     scale = max(abs(a), abs(b))
     if scale == 0.0:
         return 0.0
-    return abs(a / scale - b / scale)
+    if (a > 0.0 and b > 0.0) or (a < 0.0 and b < 0.0):
+        # Same sign: |a - b| <= max(|a|, |b|), so the difference cannot overflow, and one division gives the correctly rounded
+        # quotient. 99 against 100 is exactly 0.01 and therefore inside a 1 % limit (FINAL-RT-004, #54).
+        return abs(a - b) / scale
+    return abs(a / scale - b / scale)       # opposite signs or a zero: 1 to 2; scaling first keeps |a| + |b| from overflowing
 
 
 def reported_difference(error: float) -> float:
@@ -490,21 +501,22 @@ def ambiguous_unit(unit: str):
     return None
 
 
-def _words(text: str) -> set:
-    spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)          # dT -> d T ; deltaT -> delta T
-    return {w.lower() for w in re.findall(r"[A-Za-z]+", spaced)} | {w.lower() for w in re.findall(r"[A-Za-z]+", text)}
+def _label_tokens(text: str) -> list:
+    """Lower-case words of a property name, in order. camelCase and separators split words: `deltaT` -> delta, t."""
+    return [w.lower() for w in re.findall(r"[A-Za-z]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", text))]
 
 
 def _temperature_kind(base_names: list, field: str) -> str:
-    """Classify a pure-temperature quantity from its unit and its property name."""
-    words = _words(field)
+    """Classify a pure-temperature quantity from its unit and its property name (grammar above)."""
     if any(n.startswith("delta_") for n in base_names):
         return "interval"                                   # explicit unit: delta_degC, delta_degF
-    if words & _UNCLEAR_TEMPERATURE_WORDS:
-        return "unknown"                                    # DT, diff, superheat ...: never guessed (FR-03)
-    if words & _INTERVAL_WORDS:
+    tokens = _label_tokens(field)
+    words = set(tokens)
+    if words & _INTERVAL_HEADS and words <= _INTERVAL_HEADS | _TEMPERATURE_NOUNS | _TEMPERATURE_QUALIFIERS | {"t"}:
         return "interval"
-    return "absolute" if words & _ABSOLUTE_WORDS else "unknown"
+    if words & _TEMPERATURE_NOUNS and words <= _TEMPERATURE_NOUNS | _TEMPERATURE_QUALIFIERS:
+        return "absolute"
+    return "unknown"
 
 
 def _parse(name: str, text: str):
@@ -576,6 +588,9 @@ def _parse(name: str, text: str):
             kind = ""
             if str(quantity.dimensionality) == "[temperature]":
                 names = [n for n, _ in quantity.unit_items()]
+                for scale in names:
+                    if not _temperature_scale_supported(scale):
+                        raise UnsupportedTemperatureScale(scale)           # before any base-unit conversion
                 kind = _temperature_kind(names, field)
                 if kind == "interval" and any(n in _OFFSET_TO_DELTA for n in names):
                     quantity = UNITS.Quantity(value, _OFFSET_TO_DELTA[names[0]])     # a rise of 5 degC is 5 K, not 278.15 K
@@ -591,10 +606,13 @@ def _parse(name: str, text: str):
             key = dimension_key(quantity.dimensionality)
         except Exception as exc:  # any parser/conversion failure means: unit not usable, never a pass
             coverage["rows_unsupported_unit"] += 1
-            warnings.append({
+            refused = {
                 "code": "UNSUPPORTED_UNIT", "document": name, "line": line_number,
                 "excerpt": raw.strip(), "reason": type(exc).__name__,
-            })
+            }
+            if isinstance(exc, UnsupportedTemperatureScale):
+                refused.update(detail="TEMPERATURE_SCALE_NOT_SUPPORTED", scale=exc.scale)
+            warnings.append(refused)
             continue
         coverage["rows_parsed"] += 1
         records.append(Observation(name, line_number, tag, field, value, unit, numeric,
@@ -622,6 +640,27 @@ _TEMPERATURE_MESSAGES = {
                     "degF value converts differently in each case. Use delta_degC or delta_degF for a difference, or name the property "
                     "'temperature' for an absolute temperature. Abbreviations such as DT and terms such as superheat do not decide the kind.",
 }
+
+
+# FINAL-RT-002 (#52): the pure-temperature units SpecForge reads. Everything else of the temperature dimension (degree_Reaumur and
+# its delta, Planck or atomic temperature units, prefixed offset units) is refused BEFORE conversion to base units, because
+# Pint can convert an offset scale without SpecForge having a tested rule for its absolute and interval meaning.
+#   linear: kelvin (with SI prefixes), degree_Rankine, delta_degree_Celsius, delta_degree_Fahrenheit
+#   offset: degree_Celsius, degree_Fahrenheit (absolute; as an interval they are converted through the delta_ units)
+SUPPORTED_TEMPERATURE_SCALES = frozenset({"kelvin", "degree_Rankine", "degree_Celsius", "degree_Fahrenheit",
+                                          "delta_degree_Celsius", "delta_degree_Fahrenheit"})
+
+
+class UnsupportedTemperatureScale(ValueError):
+    """A unit of the temperature dimension outside SUPPORTED_TEMPERATURE_SCALES. The row is reported, never converted."""
+
+    def __init__(self, scale: str):
+        super().__init__(f"temperature scale {scale} is not supported")
+        self.scale = scale
+
+
+def _temperature_scale_supported(name: str) -> bool:
+    return name in SUPPORTED_TEMPERATURE_SCALES or any(base == "kelvin" for _, base, _ in UNITS.parse_unit_name(name))
 
 
 @functools.lru_cache(maxsize=256)
@@ -754,9 +793,7 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
         for record in records:
             by_source[source_name(record.document)].append(record)
         ambiguous = False
-        representatives: list[Observation] = []
         for source, same in by_source.items():
-            representatives.append(same[0])
             if len(same) == 1:
                 continue
             first, consistent = same[0], True
@@ -825,18 +862,29 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
                 "reason": "a source contradicts itself, so no value can represent it",
             })
             continue
-        reference = representatives[0]
-        for other in representatives[1:]:
+        # FINAL-RT-001 (#51): the first row of a source does not stand for the source. Every source group here is internally
+        # consistent, so two groups agree exactly when the four pairs of extremes (min/max of one group against min/max of
+        # the other) are within the allowed difference. Same sign: the difference 1 - smaller/larger grows with the distance of
+        # the magnitudes, so the worst partner of any value is the minimum or the maximum of the other group. Opposite signs or
+        # a zero against a nonzero value differ by 1 or more (allowed is at most 0.2), and the extremes contain such a pair
+        # whenever one exists. The worst pair is the evidence; ties keep the first rows, so single-row sources are unchanged.
+        groups = list(by_source.values())
+        for other_group in groups[1:]:
+            reference, other = groups[0][0], other_group[0]
             if reference.dimensionality != other.dimensionality:
                 group_warnings.append({"code": "DIMENSION_MISMATCH", "tag": tag, "field": field,
                                        "reference": asdict(reference), "other": asdict(other)})
                 continue
-            problem = _temperature_pair(reference, other)
+            problem = _temperature_group_problem(groups[0] + other_group)      # every cross pair, as one group
             if problem:
                 group_warnings.append({"code": "TEMPERATURE_SEMANTICS", "detail": problem[0], "message": problem[1],
-                                       "tag": tag, "field": field, "reference": asdict(reference), "other": asdict(other)})
+                                       "tag": tag, "field": field, "reference": asdict(problem[2]), "other": asdict(problem[3])})
                 continue
             comparisons += 1
+            extremes_a = (min(groups[0], key=lambda r: r.si_value), max(groups[0], key=lambda r: r.si_value))
+            extremes_b = (min(other_group, key=lambda r: r.si_value), max(other_group, key=lambda r: r.si_value))
+            worst = max([(reference, other), *itertools.product(extremes_a, extremes_b)], key=lambda pair: relative_error(*pair))
+            reference, other = worst
             error = relative_error(reference, other)
             item = {"scope": "cross_source", "tag": tag, "field": field, "relative_difference": reported_difference(error),
                     "reference": asdict(reference), "other": asdict(other)}
@@ -848,7 +896,7 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
     result = {
         "status": "DIFFERENCES" if findings else ("NO_COMPARABLE_ROWS" if not comparisons else "NO_DIFFERENCES_FOUND"),
         "records": len(all_records), "comparisons": comparisons,
-        "tolerance": tolerance, "findings": findings, "matches": matches,
+        "tolerance": tolerance, "effective_tolerance": allowed, "findings": findings, "matches": matches,
         "unmatched": unmatched, "warnings": warnings, "coverage": coverage,
         "scope": SCOPE,
     }
