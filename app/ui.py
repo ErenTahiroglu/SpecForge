@@ -29,7 +29,9 @@ from app.ingest import (  # noqa: E402
 from app.upload_policy import (  # noqa: E402
     PDF_DISABLED_CODE, PDF_DISABLED_MESSAGE, is_pdf_name, pdf_ui_enabled, refused_pdf_names, ui_extensions, ui_formats_text,
 )
-from app.report import VERDICT_CONFLICTS, VERDICT_MATCH, VERDICT_NONE, build_view, escape_md, render_markdown  # noqa: E402
+from app.report import (  # noqa: E402
+    VERDICT_CONFLICTS, VERDICT_MATCH, VERDICT_NONE, allowed_text, build_view, escape_md, render_markdown,
+)
 
 # Two built-in synthetic examples. The example fingerprints are unchanged (same file names and bytes as before).
 EXAMPLES = {
@@ -182,7 +184,7 @@ with st.container(horizontal=True, vertical_alignment="bottom", gap="small", key
     source = st.segmented_control("Source · both examples are synthetic", SOURCES, key="source", required=True)
     with st.popover(f"Tolerance {float(ss.get('tol', 1.0)):g} %", key="tol_pop"):
         tol_pct = st.slider("Allowed difference between two values (%)", 0.0, 20.0, 1.0, 0.1, key="tol",
-                            help="Two converted values differ if |A − B| ÷ the larger of |A| and |B| is above this limit.")
+                            help="Two converted values differ if |A − B| ÷ the larger of |A| and |B| is above this limit. A limit of exactly this size is still within. Limits below 1e-10 % are raised to 1e-10 % (rounding floor).")
     with st.popover("Formats & limits", key="limits_pop"):
         st.markdown(
             f"**Supported files:** {ui_formats_text(PDF_UI)}\n\n"
@@ -198,9 +200,10 @@ with st.container(horizontal=True, vertical_alignment="bottom", gap="small", key
             "`imperial_gallon`, `thermochemical_calorie`, `metric_horsepower`, `oil_barrel`.\n\n"
             "**Temperatures need a clear kind.** `delta_degC` and `delta_degF` are differences. A property named "
             "“temperature difference”, “rise”, “drop” or “delta T” makes `K` and `degC` a difference too. A property named "
-            "“temperature” or “temp” makes them an absolute temperature. A difference and an absolute temperature are never compared. "
-            "A `degC` or `degF` value with an unclear name (for example “DT”, “diff”, “superheat”, “range” or no label) is not compared "
-            "with a different value, because the conversion depends on the kind.\n\n"
+            "“temperature” or “temp” (with a plain qualifier such as design, operating or ambient) makes them an absolute temperature. "
+            "A difference and an absolute temperature are never compared. A `degC` or `degF` value with any other name (for example "
+            "“DT”, “diff”, “superheat”, “temperature uncertainty” or no label) is not compared with a different value, because the "
+            "conversion depends on the kind. Temperature units other than K, degR, degC and degF (for example Réaumur) are not read.\n\n"
             "**Unit text** is limited to simple units: at most 64 characters, 8 terms, `*` and `/`, and one short exponent per term "
             "(`m^2`, `m**2`, `m²`, `s^-1`). Chained exponents and other expressions are not read and are listed as an unsupported unit.\n\n"
             "SpecForge shows where two documents disagree. It does not decide which one is right "
@@ -447,7 +450,7 @@ def _evidence(ev):
 
 def _difference_line(card, view):
     st.markdown(f"Difference **{md(card.difference or '')}** (difference ÷ the larger value) · allowed "
-                f"**{md(format(view.tolerance * 100, '.10g') + ' %')}**")
+                f"**{md(allowed_text(view.tolerance, view.effective_tolerance))}**")
 
 
 def _gap_line(row):
