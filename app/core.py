@@ -582,7 +582,35 @@ def _merge_quote_blocks(blocks: dict) -> dict:
     return regions
 
 
-_CELL_LIMIT = 64   # a measurement cell is a number and a unit; a longer cell is prose, and is not given to the cell patterns
+_CELL_LIMIT = 64   # the part of a cell that follows its leading padding and qualifiers: a number and a unit fit well inside it
+_MAX_RECORD_FIELDS = 256   # a quoted record with more fields is not inspected; it is reported (fail closed), like a line over the guard
+_QUALIFIER_SYMBOLS = "~\u2248<>\u2264\u2265\u00b1+-\u2212="
+_QUALIFIER_WORDS = ("approximately", "approx", "nominal", "typical", "about", "max", "min", "nom", "typ", "ca")   # as in _QUALIFIER
+
+
+def _cell_shape(cell: str) -> str:
+    """A field as the cell patterns should see it (FINAL74-RT-001, #65): the padding in front of a value must not decide whether the
+    value is seen. One linear pass skips leading whitespace, invisible format characters, qualifier marks (~ < > + - and so on) and
+    qualifier words (max, min, approx ...); any skipped qualifier becomes a single `~ `. Only then is the first _CELL_LIMIT
+    characters of the REST taken. So `+` followed by 5 or 500 spaces and `999 bar` give the same text, and a long run of
+    qualifier marks cannot push the number out of view. A cell that is prose still begins with a word, never with a number."""
+    n, i, qualified = len(cell), 0, False
+    while i < n:
+        c = cell[i]
+        if c.isspace() or unicodedata.category(c) == "Cf":
+            i += 1
+        elif c in _QUALIFIER_SYMBOLS:
+            i, qualified = i + 1, True
+        else:
+            low = cell[i:i + 14].lower()
+            for word in _QUALIFIER_WORDS:
+                end = i + len(word)
+                if low.startswith(word) and not (end < n and cell[end].isalpha()):
+                    i, qualified = end + (1 if end < n and cell[end] == "." else 0), True
+                    break
+            else:
+                break
+    return ("~ " if qualified else "") + cell[i:i + _CELL_LIMIT].rstrip()
 
 
 def _csv_record_fields(record_lines: list, joiner: str = " ") -> list:
@@ -626,7 +654,10 @@ def _csv_block_needs_warning(lines: list, start: int, block: dict) -> bool:
         from the third field on, or a bare number after a unit field. This catches a record whose parts are spread over
         several lines, so that no single physical line looks like a row.
     A note of plain words is silent, as a one-line note is. Quoted values are never compared. Every cell is cut to a short
-    prefix before a pattern runs, and the whole region is read once, so the work stays linear in the size of the region."""
+    prefix before a pattern runs, and the whole region is read once, so the work stays linear in the size of the region.
+    What it does NOT do: a number that is not at the start of a field is not found (a note that merely mentions a number stays
+    silent), and a field is never judged by its length or by where in the record it stands: padding, qualifiers and the length of
+    an unrelated note cannot change the answer. What cannot be inspected within the guards is reported, not skipped."""
     if block["unclosed"]:
         return True
     record_lines = lines[start - 1:block["end"]]
@@ -637,12 +668,21 @@ def _csv_block_needs_warning(lines: list, start: int, block: dict) -> bool:
             return True
     for joiner in (" ", ""):                    # a break may cut a word or a number: read the record both ways
         fields = _csv_record_fields(record_lines, joiner)
-        cells = [c.strip() if len(c.strip()) <= _CELL_LIMIT else "" for c in fields]
+        if len(fields) > _MAX_RECORD_FIELDS:    # too many fields to inspect: reported, never silently complete
+            return True
+        cells = [_cell_shape(c) for c in fields]
         if _has_measurement_cell(cells):
             return True
-        if len(cells) >= 3 and _NUMBER_START.match(fields[2].strip()[:_CELL_LIMIT]):
+        if len(cells) >= 3 and _NUMBER_START.match(cells[2]):
             return True
-    if sum(len(raw) for raw in record_lines) + len(record_lines) <= MAX_LINE_CHARS:      # a short record read as one line (pipe rows)
+        for field in fields:                    # a row folded INSIDE one quoted field (`"P-9 | pressure |<break>999 bar"`)
+            if "," in field or "|" in field:
+                if len(field) > MAX_LINE_CHARS:  # a delimiter-bearing text over the line guard is not read (as LINE_TOO_LONG)
+                    return True
+                text = field.strip()
+                if ENTRY.fullmatch(text) or CSV_ENTRY.fullmatch(text) or _looks_like_row(text, True):
+                    return True
+    if sum(len(raw) for raw in record_lines) + len(record_lines) <= MAX_LINE_CHARS:      # a short record read as one line
         for flat in (" ".join(record_lines), "".join(record_lines)):
             if ENTRY.fullmatch(flat) or CSV_ENTRY.fullmatch(flat) or _looks_like_row(flat, True):
                 return True
