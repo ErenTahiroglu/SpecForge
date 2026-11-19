@@ -257,7 +257,10 @@ def _coverage_items(result: dict) -> tuple:
             gaps.append(CoverageItem(code, f"The line has {w['length']} characters. Lines over {w['limit']} characters are not read, so this row was not compared.",
                                      f"{w['document']}, {describe_location(w['document'], w['line'])}", w["excerpt"]))
         else:
-            gaps.append(CoverageItem(code, REASONS.get(code, code), f"{w['document']}, {describe_location(w['document'], w['line'])}", w["excerpt"]))
+            where = (f"{w['document']}, lines {w['line']}-{w['end_line']}" if w.get("end_line")
+                     else f"{w['document']}, {describe_location(w['document'], w['line'])}")
+            quoted = w.get("detail") in ("MULTILINE_QUOTED_FIELD", "UNCLOSED_QUOTE")   # the engine's own sentence names the span
+            gaps.append(CoverageItem(code, w["reason"] if quoted else REASONS.get(code, code), where, w["excerpt"]))
     for u in result["unmatched"]:
         gaps.append(CoverageItem(
             "UNMATCHED_RECORD",
