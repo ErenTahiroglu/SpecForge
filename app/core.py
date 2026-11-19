@@ -582,17 +582,70 @@ def _merge_quote_blocks(blocks: dict) -> dict:
     return regions
 
 
+_CELL_LIMIT = 64   # a measurement cell is a number and a unit; a longer cell is prose, and is not given to the cell patterns
+
+
+def _csv_record_fields(record_lines: list, joiner: str = " ") -> list:
+    """Fields of ONE logical CSV record, with the quote rules of _csv_quote_blocks. A line break inside a quoted field becomes
+    `joiner` (a space, or nothing, so that a word or number cut by the line break is read whole). Linear: each character is
+    visited once and the pieces of a field are joined once."""
+    fields, parts, in_quotes, at_start = [], [], False, True
+    for index, raw in enumerate(record_lines):
+        if index and in_quotes and joiner:
+            parts.append(joiner)
+        i, n = 0, len(raw)
+        while i < n:
+            c = raw[i]
+            if in_quotes:
+                if c == '"':
+                    if i + 1 < n and raw[i + 1] == '"':
+                        parts.append('"')
+                        i += 2
+                        continue
+                    in_quotes, at_start = False, False
+                else:
+                    parts.append(c)
+            elif c == ",":
+                fields.append("".join(parts))
+                parts, at_start = [], True
+            elif c == '"' and at_start:
+                in_quotes, at_start = True, False
+            else:
+                parts.append(c)
+                at_start = False
+            i += 1
+    fields.append("".join(parts))
+    return fields
+
+
 def _csv_block_needs_warning(lines: list, start: int, block: dict) -> bool:
-    """A quoted multi-line region is reported when it never closes, or when any of its physical lines (including the opening and
-    closing line) is measurement-like or too long to inspect. A note of plain words is silent, as a one-line note is."""
+    """A quoted multi-line region is ONE logical CSV record (FINAL0673-RT-001, #63). It is reported when
+      - the quote never closes, or
+      - a physical line of it is measurement-like on its own or too long to inspect (a row hidden inside a note), or
+      - the LOGICAL record is measurement-shaped by the cell rules of a one-line unsupported row: a number (or number and unit)
+        from the third field on, or a bare number after a unit field. This catches a record whose parts are spread over
+        several lines, so that no single physical line looks like a row.
+    A note of plain words is silent, as a one-line note is. Quoted values are never compared. Every cell is cut to a short
+    prefix before a pattern runs, and the whole region is read once, so the work stays linear in the size of the region."""
     if block["unclosed"]:
         return True
-    for number in range(start, block["end"] + 1):
-        raw = lines[number - 1]
+    record_lines = lines[start - 1:block["end"]]
+    for raw in record_lines:
         if len(raw) > MAX_LINE_CHARS:
             return True
         if raw.strip() and (ENTRY.fullmatch(raw) or CSV_ENTRY.fullmatch(raw) or _looks_like_row(raw, True)):
             return True
+    for joiner in (" ", ""):                    # a break may cut a word or a number: read the record both ways
+        fields = _csv_record_fields(record_lines, joiner)
+        cells = [c.strip() if len(c.strip()) <= _CELL_LIMIT else "" for c in fields]
+        if _has_measurement_cell(cells):
+            return True
+        if len(cells) >= 3 and _NUMBER_START.match(fields[2].strip()[:_CELL_LIMIT]):
+            return True
+    if sum(len(raw) for raw in record_lines) + len(record_lines) <= MAX_LINE_CHARS:      # a short record read as one line (pipe rows)
+        for flat in (" ".join(record_lines), "".join(record_lines)):
+            if ENTRY.fullmatch(flat) or CSV_ENTRY.fullmatch(flat) or _looks_like_row(flat, True):
+                return True
     return False
 
 
