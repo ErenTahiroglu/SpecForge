@@ -6,7 +6,8 @@ State lives outside the repository (default ~/.cache/specforge-checkpoint/<proje
 
 Subcommands:
   plan    scan sources, compare with stored per-index state, print a JSON plan
-  record  store the result of one index refresh (atomic write)
+  record  store the result of one index refresh (atomic write; a failed write exits 1)
+  verify-recorded   read the state file back: both indexes fresh for this scan
   verify-cbm / verify-graphify   freshness checks after a refresh
   verify-scope   fail if the code index (or a symlink in the repository) can reach a protected directory
   get     print one key from a JSON file
@@ -238,9 +239,37 @@ def cmd_record(a):
     if both:
         state["last_complete"] = {"fingerprint": scan_result["fingerprint"],
                                   "checkpoint": a.checkpoint, "at": now_iso()}
-    atomic_write(os.path.join(a.state_dir, "state.json"), state)
-    print(json.dumps({"index": a.index, "status": state[a.index]["status"], "both_fresh": both}))
+    try:
+        atomic_write(os.path.join(a.state_dir, "state.json"), state)
+    except Exception as exc:       # the previous state.json stays (atomic replace); the caller must not report success
+        print(json.dumps({"index": a.index, "ok": False, "error": "state write failed: %s" % type(exc).__name__}))
+        return 1
+    print(json.dumps({"index": a.index, "ok": True, "status": state[a.index]["status"], "both_fresh": both}))
     return 0
+
+
+def cmd_verify_recorded(a):
+    """After the two `record ... ok` writes: the state file on disk must hold BOTH indexes fresh for exactly this scan.
+    Persistence is read back from disk; the exit status of the writers alone is not taken as proof."""
+    issues = []
+    try:
+        with open(a.scan_file, "r", encoding="utf-8") as fh:
+            scan_result = json.load(fh)
+        state, reason = load_state(a.state_dir)
+        if state is None:
+            issues.append("state not readable: %s" % reason)
+        else:
+            for idx in ("cbm", "graphify"):
+                rec = state.get(idx)
+                if not isinstance(rec, dict) or rec.get("status") != "fresh" or rec.get("fingerprint") != scan_result["index_fps"][idx]:
+                    issues.append("%s baseline is not recorded as fresh for this scan" % idx)
+            last = state.get("last_complete")
+            if not isinstance(last, dict) or last.get("fingerprint") != scan_result["fingerprint"]:
+                issues.append("last_complete does not match this scan")
+    except Exception as exc:       # fail closed
+        issues.append("verification failed: %s: %s" % (type(exc).__name__, exc))
+    print(json.dumps({"ok": not issues, "issues": issues}))
+    return 0 if not issues else 1
 
 
 def parse_kv(text):
@@ -269,19 +298,38 @@ def cmd_verify_cbm(a):
     try:
         proc = subprocess.run(["codebase-memory-mcp", "cli", "check_index_coverage", "--json"],
                               input=json.dumps(args), capture_output=True, text=True, timeout=120)
-        out = proc.stdout
-        env = json.loads(out[out.index("{"):])
-        body = json.loads((env.get("result") or env)["content"][0]["text"])
-        rows = body.get("paths", [])
-        if body.get("path_has_more") or len(rows) != len(paths):
-            issues.append("coverage rows %d != manifest %d" % (len(rows), len(paths)))
-        bad = [(r.get("path"), r.get("status"), r.get("freshness")) for r in rows
-               if r.get("freshness") not in ("metadata_match", "not_tracked")
-               or r.get("status") != "no_recorded_issue"]
-        if bad:
-            issues.append("not fresh: %s" % bad[:5])
-        if body.get("metadata", {}).get("generation_matches") is False:
-            issues.append("generation mismatch")
+        if proc.returncode != 0:                        # plausible output of a failed child is not evidence (#57)
+            issues.append("coverage check exited with status %d" % proc.returncode)
+        else:
+            out = proc.stdout
+            env = json.loads(out[out.index("{"):])
+            body = json.loads((env.get("result") or env)["content"][0]["text"])
+            if not isinstance(body, dict):
+                raise ValueError("coverage body is not an object")
+            rows = body.get("paths")
+            if not isinstance(rows, list):
+                issues.append("coverage rows missing")
+                rows = []
+            if body.get("path_has_more"):
+                issues.append("coverage result is truncated")
+            returned = [r.get("path") if isinstance(r, dict) else None for r in rows]
+            if not all(isinstance(p, str) for p in returned):
+                issues.append("coverage rows without a path")
+            else:
+                # Exact identity of the requested set: no missing, extra, duplicate or re-spelled path. Strings are compared as
+                # given; nothing is resolved on disk, so no symlink is followed.
+                if len(set(returned)) != len(returned):
+                    issues.append("coverage rows repeat a path")
+                missing, extra = sorted(set(paths) - set(returned)), sorted(set(returned) - set(paths))
+                if missing or extra:
+                    issues.append("coverage paths differ from the manifest: missing %s, extra %s" % (missing[:3], extra[:3]))
+            bad = [(r.get("path"), r.get("status"), r.get("freshness")) for r in rows if isinstance(r, dict)
+                   and (r.get("freshness") not in ("metadata_match", "not_tracked") or r.get("status") != "no_recorded_issue")]
+            if bad or not all(isinstance(r, dict) for r in rows):
+                issues.append("not fresh: %s" % bad[:5])
+            metadata = body.get("metadata")
+            if not isinstance(metadata, dict) or metadata.get("generation_matches") is not True:
+                issues.append("index generation not confirmed")
     except Exception as exc:  # fail closed
         issues.append("coverage check failed: %s: %s" % (type(exc).__name__, exc))
     print(json.dumps({"ok": not issues, "issues": issues, "nodes": kv.get("nodes"),
@@ -583,8 +631,12 @@ def cmd_verify_graphify(a):
         issues.extend(graphify_inputs(a.project_dir, verify=True)["issues"])
     except Exception as exc:
         issues.append("input verification failed: %s" % exc)
-    if g.get("input_tokens", 0) != 0 or g.get("output_tokens", 0) != 0:
-        issues.append("LLM tokens recorded: in=%s out=%s" % (g.get("input_tokens"), g.get("output_tokens")))
+    # Token counters are evidence only when both are present as real integers. A missing or malformed counter is UNKNOWN, never zero.
+    tin, tout = g.get("input_tokens"), g.get("output_tokens")
+    counted = [v for v in (tin, tout) if type(v) is int and v >= 0]
+    if any(v > 0 for v in counted):
+        issues.append("LLM tokens recorded: in=%s out=%s" % (tin, tout))
+    llm_tokens = "0" if len(counted) == 2 and not any(counted) else "UNKNOWN"
     sources = {n.get("source_file") for n in nodes if n.get("source_file")}
     stale = sorted(s for s in sources if not os.path.exists(os.path.join(a.project_dir, s)))
     if stale:
@@ -594,7 +646,7 @@ def cmd_verify_graphify(a):
     missing = sorted(p for p in manifest if p.endswith(".py") and p not in sources and os.path.getsize(os.path.join(a.project_dir, p)))
     if missing:
         issues.append("python files missing from graph: %s" % missing[:5])
-    print(json.dumps({"ok": not issues, "issues": issues, "nodes": len(nodes), "edges": len(links)}))
+    print(json.dumps({"ok": not issues, "issues": issues, "nodes": len(nodes), "edges": len(links), "llm_tokens": llm_tokens}))
     return 0 if not issues else 1
 
 
@@ -629,6 +681,10 @@ def main():
     s.add_argument("--nodes", default=None)
     s.add_argument("--edges", default=None)
     s.set_defaults(fn=cmd_record)
+    s = sub.add_parser("verify-recorded")
+    s.add_argument("--state-dir", required=True)
+    s.add_argument("--scan-file", required=True)
+    s.set_defaults(fn=cmd_verify_recorded)
     s = sub.add_parser("verify-cbm")
     s.add_argument("--project-dir", required=True)
     s.add_argument("--project", required=True)

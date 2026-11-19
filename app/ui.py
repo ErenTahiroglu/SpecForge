@@ -448,6 +448,16 @@ def _evidence(ev):
     st.code(shown(ev.excerpt), language=None, wrap_lines=True)
 
 
+def _gap_code(gap):
+    """The original row(s) of a gap. Items built from several rows show each one under its own file and location."""
+    if len(getattr(gap, "evidence", ())) > 1:
+        for record in gap.evidence:
+            owned_html(f'<span class="sf-loc"><bdi>{esc(record["document"])}</bdi> · {esc(record["location"])}</span>')
+            st.code(shown(record["excerpt"]), language=None, wrap_lines=True)
+    elif gap.excerpt:
+        st.code(shown(gap.excerpt), language=None, wrap_lines=True)
+
+
 def _difference_line(card, view):
     st.markdown(f"Difference **{md(card.difference or '')}** (difference ÷ the larger value) · allowed "
                 f"**{md(allowed_text(view.tolerance, view.effective_tolerance))}**")
@@ -457,8 +467,7 @@ def _gap_line(row):
     if row["kind"] == "gap":
         gap = row["gap"]
         owned_html(f'<b>{esc(REASON.get(gap.code, gap.code))}</b> · <bdi>{esc(gap.location)}</bdi> · <code>{esc(gap.code)}</code>')
-        if gap.excerpt:
-            st.code(shown(gap.excerpt), language=None, wrap_lines=True)
+        _gap_code(gap)
     else:
         issue = row["issue"]
         owned_html(f'<b>Input processing issue</b> · {esc(issue.get("message", ""))} · <code>{esc(issue.get("code", ""))}</code>')
@@ -587,8 +596,7 @@ def inspector(row, view):
         gap = row["gap"]
         st.markdown(f"#### Not compared · {md(REASON.get(gap.code, gap.code))}", anchors=False)
         owned_html(f'Where: <bdi>{esc(gap.location)}</bdi> · code <code>{esc(gap.code)}</code>')
-        if gap.excerpt:
-            st.code(shown(gap.excerpt), language=None, wrap_lines=True)
+        _gap_code(gap)
         st.markdown(md(gap.summary))
         st.caption("No counterpart is paired with this item, and no value, SI form or difference is shown for it, "
                    "because it was not compared.")
@@ -675,8 +683,7 @@ def detailed(audit, rows_all):
             for item in view.notes:
                 st.markdown(md(item.summary))
                 st.caption(md(item.location))
-                if item.excerpt:
-                    st.code(shown(item.excerpt), language=None, wrap_lines=True)
+                _gap_code(item)
     st.caption(UNSEEN)
 
 
