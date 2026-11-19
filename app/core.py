@@ -21,17 +21,20 @@ import json
 import math
 import re
 import sys
+import unicodedata
 from typing import Mapping
 import pint
 
 UNITS = pint.UnitRegistry(autoconvert_offset_to_baseunit=True)
 
-_NUM = r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)"
+# ASCII digits only (#56): Python's \d and float() also accept other decimal digits (Arabic-Indic, full-width ...). A number in such a script
+# could underflow to 0.0 unseen by the ASCII underflow guard, so it is not part of the grammar; the row is reported instead (UNPARSED_ROW).
+_NUM = r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)"
 _UNIT = r"[A-Za-z°µμ][\w°µμ/%^.*-]*"
 ENTRY = re.compile(
     r"^\s*\|?\s*(?P<tag>[A-Za-z][\w-]{1,31})\s*\|\s*"
     r"(?P<field>[A-Za-z][\w -]{1,47})\s*\|\s*"
-    r"(?P<value>[+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*"
+    r"(?P<value>[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+))\s*"
     r"(?P<unit>[A-Za-z°µμ][\w°µμ/%^.*-]*)\s*\|?\s*$"
 )
 CSV_ENTRY = re.compile(
@@ -552,10 +555,15 @@ def _parse(name: str, text: str):
                 coverage["rows_unparsed"] += 1
                 quoted = any(q in raw for q in _QUOTE_CHARS)
                 comma_outside_csv = not csv_file and "," in raw and "|" not in raw
-                warnings.append({"code": "UNPARSED_ROW", "document": name, "line": line_number, "excerpt": raw.strip(),
-                                 "reason": ("row uses quoted fields, which are not supported; it was not compared" if quoted
-                                            else "comma-separated rows are read only from .csv files; it was not compared" if comma_outside_csv
-                                            else "row does not match the supported format")})
+                non_ascii_digits = any(unicodedata.category(ch) == "Nd" and ch not in _ASCII_DIGITS for ch in raw)
+                warning = {"code": "UNPARSED_ROW", "document": name, "line": line_number, "excerpt": raw.strip(),
+                           "reason": ("row uses non-ASCII decimal digits, which are not supported; it was not compared" if non_ascii_digits
+                                      else "row uses quoted fields, which are not supported; it was not compared" if quoted
+                                      else "comma-separated rows are read only from .csv files; it was not compared" if comma_outside_csv
+                                      else "row does not match the supported format")}
+                if non_ascii_digits:
+                    warning["detail"] = "NON_ASCII_DIGITS"
+                warnings.append(warning)
             continue
         tag, field = match["tag"], match["field"].strip()
         value, unit = float(match["value"]), match["unit"]
