@@ -140,3 +140,61 @@ def test_streamlit_shows_both_files_and_both_excerpts_for_a_two_sided_gap(view_n
     assert "a.md" in page_text and "b.md" in page_text
     exported = json.loads(at.session_state["audit"]["json"])
     assert exported["coverage_complete"] is False
+
+
+# ---- the Notes section of the Markdown report (owner review of PR #59) --------------------------------------------------------
+def notes_section(md):
+    """Only the text of '## Notes (do not reduce coverage)', up to the next heading."""
+    assert "## Notes (do not reduce coverage)" in md
+    return md.split("## Notes (do not reduce coverage)", 1)[1].split("\n## ", 1)[0]
+
+
+def test_consistent_repeats_list_every_original_row_in_the_markdown_notes_section():
+    docs = {"a.md": "P-1 | pressure | 10 bar\nP-1 | pressure | 10.02 bar\n", "b.md": "P-1 | pressure | 10 bar\n"}
+    view, md = md_of(audit_documents(docs, 0.01))
+    notes = notes_section(md)                 # the comparison table elsewhere also shows a row: only this section counts
+    records = [l for l in notes.splitlines() if l.startswith("  - ")]
+    assert len(records) == 2
+    assert records[0] == "  - a.md, line 1: `P-1 | pressure | 10 bar`"
+    assert records[1] == "  - a.md, line 2: `P-1 | pressure | 10.02 bar`"
+    assert "- **DUPLICATE_IDENTIFIER**" in notes and "lowest and highest" in notes
+
+
+def test_three_consistent_repeats_keep_their_own_lines_and_files():
+    docs = {"a.md": "P-1 | pressure | 10 bar\nP-1 | pressure | 10.01 bar\nP-1 | pressure | 10.02 bar\n",
+            "b.md": "P-1 | pressure | 10 bar\nP-1 | pressure | 10.03 bar\n"}
+    view, md = md_of(audit_documents(docs, 0.01))
+    records = [l for l in notes_section(md).splitlines() if l.startswith("  - ")]
+    assert [r.split(":")[0] for r in records] == ["  - a.md, line 1", "  - a.md, line 2", "  - a.md, line 3", "  - b.md, line 1", "  - b.md, line 2"]
+
+
+def test_note_evidence_is_escaped_fenced_and_never_cut_by_a_line_break():
+    r = copy.deepcopy(audit_documents({"a.md": "P-1 | pressure | 10 bar\nP-1 | pressure | 10.02 bar\n", "b.md": "P-1 | pressure | 10 bar\n"}, 0.01))
+    dup = [w for w in r["warnings"] if w["code"] == "DUPLICATE_IDENTIFIER"][0]
+    dup["excerpts"][1] = "first part\u2028second `part` <script>alert(1)</script> [x](http://example.invalid) \u202e"
+    dup["documents"][0] = "<img src=x onerror=alert(1)>.md"
+    view, md = md_of(r, {"a.md": "Document A", "b.md": "Document B"})
+    records = [l for l in notes_section(md).splitlines() if l.startswith("  - ")]
+    assert len(records) == 2 and "\u2028" not in notes_section(md)
+    assert "<img" not in records[0].replace("\\<img", "") and records[0].startswith("  - \\<img")
+    assert "\u23ce" in records[1] and "second" in records[1]                 # the break is marked, nothing after it is lost
+    assert "``" in records[1] or records[1].count("`") >= 4                  # the backtick in the text needs a longer fence
+    assert "[x](http" in records[1]                                          # inside a code span, so it is not a link
+
+
+def test_a_single_row_note_keeps_its_one_line_form():
+    from app.report import CoverageItem
+    view, _ = md_of(audit_documents({"a.md": "P-1 | pressure | 10 bar\n", "b.md": "P-1 | pressure | 10 bar\n"}))
+    view.notes = [CoverageItem("SOME_NOTE", "One row note", "a.md, line 1", "P-1 | pressure | 10 bar", informational=True)]
+    md = render_markdown(view, "2026-11-19 00:00 UTC")
+    assert "- **SOME_NOTE** — One row note (a.md, line 1)" in notes_section(md)
+    assert not [l for l in notes_section(md).splitlines() if l.startswith("  - ")]
+
+
+def test_notes_do_not_change_verdict_counters_or_json():
+    docs = {"a.md": "P-1 | pressure | 10 bar\nP-1 | pressure | 10.02 bar\n", "b.md": "P-1 | pressure | 10 bar\n"}
+    r = audit_documents(docs, 0.01)
+    view, md = md_of(r)
+    assert view.coverage_complete is True and view.metrics["not_compared"] == 0 and r["verdict"] == "NO_CONFLICTS_IN_COMPARED_ROWS"
+    assert "Coverage complete: yes" in md and "## Not compared (coverage)\n\nEvery supported row found was compared." in md
+    assert [w for w in r["warnings"] if w["code"] == "DUPLICATE_IDENTIFIER"][0]["consistent"] is True

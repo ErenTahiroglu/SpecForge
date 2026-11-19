@@ -375,13 +375,17 @@ def render_markdown(view: AuditView, generated_at: Optional[str] = None) -> str:
     for item in view.coverage:
         if len(item.evidence) > 1:                          # one line per original row: file, location, the whole excerpt
             out.append(f"- **{item.code}** — {e(item.summary)}")
-            out += [f"  - {e(r['document'])}, {e(r['location'])}: {_inline_code(_one_line(r['excerpt']))}" for r in item.evidence]
+            out += _evidence_lines(item)
             continue
         line = f"- **{item.code}** — {e(item.summary)} ({e(item.location)})"
         out.append(line + (f": {_inline_code(_one_line(item.excerpt))}" if item.excerpt else ""))
     if view.notes:
         out += ["", "## Notes (do not reduce coverage)", ""]
         for item in view.notes:
+            if len(item.evidence) > 1:                      # consistent repeats: every original row, as for a gap
+                out.append(f"- **{item.code}** — {e(item.summary)}")
+                out += _evidence_lines(item)
+                continue
             out.append(f"- **{item.code}** — {e(item.summary)} ({e(item.location)})")
     out += ["", "## Limits of this report", "", f"- {e(view.scope)}.",
             "- Only rows in the supported format are read: `TAG | property | number unit`, or comma-separated rows in .csv files.",
@@ -396,6 +400,11 @@ _LINE_BREAKS = re.compile(r"\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
 def _one_line(text: str) -> str:
     """An excerpt on one Markdown line. Every line break is replaced by a visible marker, so nothing is cut off silently."""
     return _LINE_BREAKS.sub(" \u23ce ", text)
+
+
+def _evidence_lines(item) -> list:
+    """One indented list entry per original row: file, location, the whole excerpt in a code span (line breaks marked)."""
+    return [f"  - {escape_md(r['document'])}, {escape_md(r['location'])}: {_inline_code(_one_line(r['excerpt']))}" for r in item.evidence]
 
 
 def _fence(text: str) -> str:
