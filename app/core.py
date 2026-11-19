@@ -565,6 +565,23 @@ def _csv_quote_blocks(lines: list) -> dict:
     return blocks
 
 
+def _merge_quote_blocks(blocks: dict) -> dict:
+    """Quoted fields of ONE logical record share a physical line (the line where field A closes also opens field B), so their
+    line ranges overlap. Merge each such chain into one region: one warning, truthful opening and closing line. The scan above
+    yields blocks in ascending order, so this is a single pass."""
+    regions, current = {}, None
+    for start in sorted(blocks):
+        block = blocks[start]
+        if current is not None and start <= regions[current]["end"]:
+            region = regions[current]
+            region["end"] = max(region["end"], block["end"])
+            region["unclosed"] = region["unclosed"] or block["unclosed"]
+        else:
+            current = start
+            regions[start] = {"end": block["end"], "unclosed": block["unclosed"]}
+    return regions
+
+
 def _csv_block_needs_warning(lines: list, start: int, block: dict) -> bool:
     """A quoted multi-line region is reported when it never closes, or when any of its physical lines (including the opening and
     closing line) is measurement-like or too long to inspect. A note of plain words is silent, as a one-line note is."""
@@ -590,7 +607,7 @@ def _parse(name: str, text: str):
     warnings: list[dict] = []
     coverage = {"lines": len(lines), "rows_parsed": 0, "rows_unsupported_unit": 0, "rows_ambiguous_unit": 0, "rows_unparsed": 0,
                 "rows_too_long": 0}
-    blocks = _csv_quote_blocks(lines) if csv_file and '"' in text else {}
+    blocks = _merge_quote_blocks(_csv_quote_blocks(lines)) if csv_file and '"' in text else {}
     inside_quotes = {n for start, b in blocks.items() for n in range(start + 1, b["end"] + 1)}   # never given to the row grammar
     for line_number, raw in enumerate(lines, 1):
         if line_number in inside_quotes:
@@ -601,9 +618,9 @@ def _parse(name: str, text: str):
             coverage["rows_unparsed"] += 1
             warnings.append({"code": "UNPARSED_ROW", "document": name, "line": line_number, "end_line": block["end"],
                              "excerpt": text_[:_EXCERPT_CHARS] + ("\u2026" if len(text_) > _EXCERPT_CHARS else ""),
-                             "reason": (f"a quoted CSV field opens here and is never closed; nothing from here to line {block['end']} was compared"
+                             "reason": (f"a quoted CSV field opens here and is never closed; the rest of the file (to line {block['end']}) was not compared"
                                         if block["unclosed"] else
-                                        f"a quoted CSV field spans lines {line_number} to {block['end']} and contains measurement-like text; none of it was compared"),
+                                        f"quoted CSV text spans lines {line_number} to {block['end']} and contains measurement-like text; none of it was compared"),
                              "detail": "UNCLOSED_QUOTE" if block["unclosed"] else "MULTILINE_QUOTED_FIELD"})
             continue
         if not raw.strip():

@@ -242,3 +242,195 @@ def test_streamlit_shows_no_green_result_and_exports_agree():
     assert (exported["verdict"], exported["coverage_complete"]) == ("NO_CONFLICTS_PARTIAL_COVERAGE", False)
     md = at.session_state["audit"]["markdown"]
     assert "Coverage complete: no" in md and "UNPARSED_ROW" in md and "999 bar" not in md
+
+
+# ================================================================================================================================
+# Adjacent quoted fields in ONE logical record (owner re-review of PR #62): the line where field A closes can also open field B.
+# ================================================================================================================================
+ADJACENT = GOOD_A + 'N-1,"plain start\nplain end","second starts\nP-9,pressure,999 bar\nsecond end",x\n'
+
+
+def oracle_multiline_records(text):
+    """[(first_line, last_line, [every physical sub-line of every field])] for records the csv module reads over several lines."""
+    reader = csv.reader(io.StringIO(text, newline=""))
+    out, previous = [], 0
+    for fields in reader:
+        first, last = previous + 1, reader.line_num
+        if last > first:
+            out.append((first, last, [part for field in fields for part in field.split("\n")]))
+        previous = last
+    return out
+
+
+def hidden_measurements(text):
+    """Sub-lines inside multi-line records that are, on their own, a complete supported row. Independent of the scanner under test."""
+    return [part for _, _, parts in oracle_multiline_records(text) for part in parts[1:] if core.ENTRY.fullmatch(part) or core.CSV_ENTRY.fullmatch(part)]
+
+
+def test_the_owner_fixture_is_one_record_with_two_quoted_fields_per_the_oracle():
+    spans = oracle_multiline_records(ADJACENT)
+    assert [(a, b) for a, b, _ in spans] == [(2, 5)]
+    assert list(csv.reader(io.StringIO(ADJACENT, newline="")))[1][2] == "second starts\nP-9,pressure,999 bar\nsecond end"
+
+
+@pytest.mark.parametrize("swap", [False, True])
+def test_the_second_quoted_field_is_not_missed(swap):
+    docs = {"b.csv": GOOD_B, "a.csv": ADJACENT} if swap else {"a.csv": ADJACENT, "b.csv": GOOD_B}
+    r = audit_documents(docs, 0.01)
+    assert r["verdict"] == "NO_CONFLICTS_PARTIAL_COVERAGE" and r["coverage_complete"] is False and r["comparisons"] == 1
+    (w,) = unparsed(r)
+    assert (w["document"], w["line"], w["end_line"], w["detail"]) == ("a.csv", 2, 5, "MULTILINE_QUOTED_FIELD")
+    assert w["excerpt"] == 'N-1,"plain start' and r["coverage"]["a.csv"]["rows_unparsed"] == 1
+    assert r["records"] == 2 and FORGED not in json.dumps(r) and "999" not in json.dumps(r)
+    assert_no_forgery(r)
+
+
+def build_record(fields, eol="\n", tail=",x", unclosed=False):
+    """One CSV record whose fields are all multi-line quoted fields glued on shared lines: field i closes where field i+1 opens."""
+    parts = []
+    for index, lines in enumerate(fields):
+        first = ('N-1,"' if index == 0 else '","') + lines[0]
+        parts.append([first] + list(lines[1:-1]) + [lines[-1]])
+    flat = []
+    for index, lines in enumerate(parts):
+        if index == 0:
+            flat += lines
+        else:
+            flat[-1] = flat[-1] + lines[0]                       # the closing line of the previous field also opens this one
+            flat += lines[1:]
+    flat[-1] += "" if unclosed else '"' + tail
+    return eol.join(flat) + eol
+
+
+PLAIN, MEAS = ["words one", "words two"], ["words", "P-9,pressure,999 bar", "more words"]
+
+
+@pytest.mark.parametrize("fields,flagged", [
+    ([PLAIN, PLAIN], False), ([MEAS, PLAIN], True), ([PLAIN, MEAS], True), ([MEAS, MEAS], True),
+    ([PLAIN, PLAIN, PLAIN], False), ([PLAIN, PLAIN, MEAS], True), ([PLAIN, MEAS, PLAIN], True), ([MEAS, PLAIN, PLAIN], True),
+    ([PLAIN, PLAIN, PLAIN, MEAS], True), ([["a ""b"" c", "d"], ["P-9 | pressure | 999 bar", "e"]], True),
+    ([["x, with comma | and pipe", "y"], ["z", "t, u | v"]], False),
+])
+@pytest.mark.parametrize("eol", ["\n", "\r\n", "\r"])
+@pytest.mark.parametrize("swap", [False, True])
+def test_every_combination_of_adjacent_quoted_fields(fields, flagged, eol, swap):
+    record = build_record([[l.replace('""', '""') for l in f] for f in fields], eol)
+    a = ("P-1,pressure,10 bar" + eol + record + "P-2,length,5 m" + eol)
+    b = "P-1,pressure,10 bar" + eol + "P-2,length,5 m" + eol
+    spans = oracle_multiline_records(a)
+    assert len(spans) == 1                                       # the whole glued record is one logical record
+    docs = {"b.csv": b, "a.csv": a} if swap else {"a.csv": a, "b.csv": b}
+    records, warnings, coverage = core._parse("a.csv", a)
+    assert [rec.tag for rec in records] == ["P-1", "P-2"]
+    r = audit_documents(docs, 0.01)
+    assert r["comparisons"] == 2
+    if flagged:
+        (w,) = unparsed(r)
+        assert (w["line"], w["end_line"]) == (spans[0][0], spans[0][1]) and w["detail"] == "MULTILINE_QUOTED_FIELD"
+        assert r["verdict"] == "NO_CONFLICTS_PARTIAL_COVERAGE" and r["coverage_complete"] is False and coverage["rows_unparsed"] == 1
+    else:
+        assert not unparsed(r) and r["verdict"] == "NO_CONFLICTS_IN_COMPARED_ROWS" and r["coverage_complete"] is True
+
+
+@pytest.mark.parametrize("last_field", [PLAIN, MEAS])
+def test_an_unclosed_final_field_after_closed_ones_is_one_unclosed_warning(last_field):
+    text = GOOD_A + build_record([PLAIN, last_field], unclosed=True) + "P-2,length,5 m\n"
+    records, warnings, _ = core._parse("a.csv", text)
+    assert [rec.tag for rec in records] == ["P-1"]
+    (w,) = [w for w in warnings if w["code"] == "UNPARSED_ROW"]
+    assert w["detail"] == "UNCLOSED_QUOTE" and w["line"] == 2 and w["end_line"] == len(text.split("\n")) - 1 and "P-2" not in w["excerpt"]
+
+
+def test_two_separate_records_are_two_separate_warnings():
+    first, second = build_record([PLAIN, MEAS]), build_record([MEAS, PLAIN])
+    text = GOOD_A + first + "P-3,length,2 m\n" + second
+    records, warnings, _ = core._parse("a.csv", text)
+    assert [rec.tag for rec in records] == ["P-1", "P-3"]
+    spans = [(a, b) for a, b, _ in oracle_multiline_records(text)]
+    assert [(w["line"], w["end_line"]) for w in warnings if w["code"] == "UNPARSED_ROW"] == spans and len(spans) == 2
+
+
+def test_a_closing_line_that_also_closes_the_record_and_starts_a_normal_record_is_not_merged():
+    text = 'N-1,"a\nb",x\nN-2,"c\nP-9,pressure,999 bar",y\n'
+    spans = [(a, b) for a, b, _ in oracle_multiline_records(text)]
+    assert spans == [(1, 2), (3, 4)]
+    _, warnings, _ = core._parse("a.csv", text)
+    assert [(w["line"], w["end_line"]) for w in warnings if w["code"] == "UNPARSED_ROW"] == [(3, 4)]
+
+
+def test_adjacent_fields_across_many_lines_stay_linear_and_give_one_warning():
+    import time
+    lines = ['N-1,"start'] + ['mid","m2'] * 3000 + ['end",x']
+    text = GOOD_A + "\n".join(lines) + "\n"
+    started = time.perf_counter()
+    records, warnings, coverage = core._parse("a.csv", text)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 2.0 and [rec.tag for rec in records] == ["P-1"]
+    assert warnings == [] or all(w["detail"] in ("MULTILINE_QUOTED_FIELD", "UNCLOSED_QUOTE") for w in warnings)
+    assert len(warnings) <= 1 and coverage["rows_unparsed"] == len(warnings)
+
+
+# ---- property: reference logical records decide what is hidden ----------------------------------------------------------------------
+ADJ_FRAGMENTS = FRAGMENTS + ['a","b', 'x"," y', 'end","start', 'm","P-9,pressure,999 bar', '"p","q', 'r","s",t', f'N,"{FORGED}', f'{FORGED}","u']
+
+
+@settings(max_examples=800, deadline=None)
+@given(st.lists(st.sampled_from(ADJ_FRAGMENTS), min_size=1, max_size=9), st.sampled_from(["\n", "\r\n"]))
+def test_property_a_complete_row_hidden_inside_any_logical_record_never_gives_a_complete_verdict(parts, eol):
+    text = eol.join(parts) + eol
+    hidden = hidden_measurements(text)
+    records, warnings, _ = core._parse("a.csv", text)
+    inside = oracle_continuation_lines(text)
+    assert set(rec.line for rec in records).isdisjoint(inside)
+    r = audit(text, GOOD_B)
+    if hidden:
+        assert r["coverage_complete"] is False and r["verdict"] != "NO_CONFLICTS_IN_COMPARED_ROWS", (parts, hidden)
+        flagged = [(w["line"], w["end_line"]) for w in warnings if w["code"] == "UNPARSED_ROW" and "end_line" in w]
+        spans = [(a, b) for a, b, ps in oracle_multiline_records(text) if any(core.ENTRY.fullmatch(p) or core.CSV_ENTRY.fullmatch(p) for p in ps[1:])]
+        for span in spans:
+            assert span in flagged, (parts, span, flagged)          # the warning names the opening line and the end of THAT record
+
+
+@settings(max_examples=300, deadline=None)
+@given(st.lists(st.sampled_from(ADJ_FRAGMENTS), min_size=1, max_size=9))
+def test_property_warnings_never_overlap_and_match_record_spans(parts):
+    text = "\n".join(parts) + "\n"
+    _, warnings, coverage = core._parse("a.csv", text)
+    spans = [(w["line"], w["end_line"]) for w in warnings if "end_line" in w]
+    assert all(a <= b for a, b in spans) and all(spans[i][1] < spans[i + 1][0] for i in range(len(spans) - 1))
+    oracle = {(a, b) for a, b, _ in oracle_multiline_records(text)}
+    unclosed_tail = bool(spans) and spans[-1][1] == len(text.split("\n")) - 1
+    assert all(s in oracle or (unclosed_tail and s == spans[-1]) for s in spans), (parts, spans, oracle)
+    assert coverage["rows_unparsed"] >= len(spans)
+
+
+# ---- every entry point on the owner fixture ------------------------------------------------------------------------------------------
+def test_fastapi_agrees_on_the_owner_fixture():
+    from fastapi.testclient import TestClient
+    from app.api import app
+    body = TestClient(app).post("/audit", json={"documents": {"a.csv": ADJACENT, "b.csv": GOOD_B}}).json()
+    assert body["verdict"] == "NO_CONFLICTS_PARTIAL_COVERAGE" and body["coverage_complete"] is False
+    assert [(w["line"], w["end_line"]) for w in body["warnings"] if w["code"] == "UNPARSED_ROW"] == [(2, 5)]
+
+
+def test_markdown_and_streamlit_agree_on_the_owner_fixture():
+    r = audit(ADJACENT)
+    md = render_markdown(build_view(r, {"a.csv": "Document A", "b.csv": "Document B"}), "2026-11-19 00:00 UTC")
+    assert "Coverage complete: no" in md and "lines 2-5" in md.replace("\\", "") and "999" not in md and "P-9" not in md
+    from streamlit.testing.v1 import AppTest
+    at = AppTest.from_file(str(UI), default_timeout=60)
+    at.run()
+    at.get("file_uploader")[0].upload("a.csv", ADJACENT.encode(), "text/csv")
+    at.get("file_uploader")[1].upload("b.csv", GOOD_B.encode(), "text/csv")
+    at.run()
+    next(x for x in at.button if x.label == "Run audit").click().run()
+    assert not at.exception and len(at.success) == 0
+    exported = json.loads(at.session_state["audit"]["json"])
+    assert (exported["verdict"], exported["coverage_complete"]) == ("NO_CONFLICTS_PARTIAL_COVERAGE", False)
+    assert "lines 2-5" in at.session_state["audit"]["markdown"].replace("\\", "")
+
+
+def test_the_mcp_tool_stays_pipe_only():
+    from app.mcp_server import compare_engineering_rows
+    r = compare_engineering_rows(ADJACENT, GOOD_B)
+    assert r["coverage_complete"] is False
