@@ -509,10 +509,19 @@ def _label_tokens(text: str) -> list:
     return [w.lower() for w in re.findall(r"[A-Za-z]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", text))]
 
 
+# FROZEN-RT-001 (#60): the row grammar lets a property name hold any Unicode word character, but the label grammar reads ASCII
+# letters only. A character it cannot read (a Greek delta, an accented or look-alike letter, a digit) used to disappear from the
+# tokens, and the rest of the name then looked like a clear label. Now the whole name must be ASCII letters, spaces, `_` or `-`;
+# otherwise the kind is unknown. Nothing is deleted, transliterated or guessed.
+_LABEL_CHARS = re.compile(r"[A-Za-z _-]+")
+
+
 def _temperature_kind(base_names: list, field: str) -> str:
     """Classify a pure-temperature quantity from its unit and its property name (grammar above)."""
     if any(n.startswith("delta_") for n in base_names):
         return "interval"                                   # explicit unit: delta_degC, delta_degF
+    if not _LABEL_CHARS.fullmatch(field):
+        return "unknown"
     tokens = _label_tokens(field)
     words = set(tokens)
     if words & _INTERVAL_HEADS and words <= _INTERVAL_HEADS | _TEMPERATURE_NOUNS | _TEMPERATURE_QUALIFIERS | {"t"}:
@@ -520,6 +529,54 @@ def _temperature_kind(base_names: list, field: str) -> str:
     if words & _TEMPERATURE_NOUNS and words <= _TEMPERATURE_NOUNS | _TEMPERATURE_QUALIFIERS:
         return "absolute"
     return "unknown"
+
+
+def _csv_quote_blocks(lines: list) -> dict:
+    """{opening line number: {"end": last line number, "unclosed": bool}} for every quoted CSV field that spans physical lines.
+
+    A linear scan with the rules of Python's csv module (default dialect): a quote opens a quoted field only at the start of a
+    field, `""` inside quotes is an escaped quote, a quote in the middle of an unquoted field is literal, and a line break inside
+    quotes belongs to the field. Only lines that contain a quote, or lie inside an open quoted field, are scanned character by
+    character, and each character is visited once. It never builds a per-record string (FROZEN-RT-002, #61)."""
+    blocks, in_quotes, start = {}, False, 0
+    for number, raw in enumerate(lines, 1):
+        if not in_quotes and '"' not in raw:
+            continue
+        at_start, i, n = not in_quotes, 0, len(raw)
+        while i < n:
+            c = raw[i]
+            if in_quotes:
+                if c == '"':
+                    if i + 1 < n and raw[i + 1] == '"':
+                        i += 2
+                        continue
+                    in_quotes, at_start = False, False
+                    if number != start:
+                        blocks[start] = {"end": number, "unclosed": False}
+            elif c == ",":
+                at_start = True
+            elif c == '"' and at_start:
+                in_quotes, at_start, start = True, False, number
+            else:
+                at_start = False
+            i += 1
+    if in_quotes:
+        blocks[start] = {"end": len(lines), "unclosed": True}
+    return blocks
+
+
+def _csv_block_needs_warning(lines: list, start: int, block: dict) -> bool:
+    """A quoted multi-line region is reported when it never closes, or when any of its physical lines (including the opening and
+    closing line) is measurement-like or too long to inspect. A note of plain words is silent, as a one-line note is."""
+    if block["unclosed"]:
+        return True
+    for number in range(start, block["end"] + 1):
+        raw = lines[number - 1]
+        if len(raw) > MAX_LINE_CHARS:
+            return True
+        if raw.strip() and (ENTRY.fullmatch(raw) or CSV_ENTRY.fullmatch(raw) or _looks_like_row(raw, True)):
+            return True
+    return False
 
 
 def _parse(name: str, text: str):
@@ -533,7 +590,22 @@ def _parse(name: str, text: str):
     warnings: list[dict] = []
     coverage = {"lines": len(lines), "rows_parsed": 0, "rows_unsupported_unit": 0, "rows_ambiguous_unit": 0, "rows_unparsed": 0,
                 "rows_too_long": 0}
+    blocks = _csv_quote_blocks(lines) if csv_file and '"' in text else {}
+    inside_quotes = {n for start, b in blocks.items() for n in range(start + 1, b["end"] + 1)}   # never given to the row grammar
     for line_number, raw in enumerate(lines, 1):
+        if line_number in inside_quotes:
+            continue                       # part of a quoted CSV field that began on an earlier line (#61)
+        block = blocks.get(line_number)
+        if block and _csv_block_needs_warning(lines, line_number, block):
+            text_ = raw.strip()
+            coverage["rows_unparsed"] += 1
+            warnings.append({"code": "UNPARSED_ROW", "document": name, "line": line_number, "end_line": block["end"],
+                             "excerpt": text_[:_EXCERPT_CHARS] + ("\u2026" if len(text_) > _EXCERPT_CHARS else ""),
+                             "reason": (f"a quoted CSV field opens here and is never closed; nothing from here to line {block['end']} was compared"
+                                        if block["unclosed"] else
+                                        f"a quoted CSV field spans lines {line_number} to {block['end']} and contains measurement-like text; none of it was compared"),
+                             "detail": "UNCLOSED_QUOTE" if block["unclosed"] else "MULTILINE_QUOTED_FIELD"})
+            continue
         if not raw.strip():
             continue                       # ingress: a blank line is never a row (linear time, no regular expression)
         if "|" not in raw and "," not in raw:
