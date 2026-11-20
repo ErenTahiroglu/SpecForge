@@ -6,6 +6,7 @@
 # Never: git network ops, installs/upgrades, LLM calls, or signalling/stopping any process.
 #
 # Exit codes: 0 ok/NO_CHANGE | 1 tests failed | 2 index failure/partial | 3 PROCESS_CONFLICT_BLOCKED
+#             4 BASELINE_NOT_PERSISTED (a baseline write failed or could not be read back; state may be partially updated)
 #
 # Test-only env hooks:
 #   CHECKPOINT_STATE_DIR          override baseline directory (default outside the repo)
@@ -165,13 +166,24 @@ fi
 
 # ---------------- STEP E: report ----------------
 log "=== STEP E: summary ==="
-log "cbm=$CBM_RESULT graphify=$GFY_RESULT llm_tokens=0(verified in graph.json) processes_signalled=0"
+# llm_tokens is stated only from the checked counters in graph.json (verify-graphify); anything else is UNKNOWN.
+TOKENS="UNKNOWN"
+if [ -f "$WORK/gfy_v.json" ] && [ "$(jget "$WORK/gfy_v.json" llm_tokens 2>/dev/null || true)" = "0" ]; then TOKENS="0 (counters in graph.json)"; fi
+log "cbm=$CBM_RESULT graphify=$GFY_RESULT llm_tokens=$TOKENS processes_signalled=0"
 if [ $CONFLICT -eq 1 ]; then log "RESULT: PROCESS_CONFLICT_BLOCKED"; exit 3; fi
 case "$CBM_RESULT/$GFY_RESULT" in
   fresh*/fresh*)
     # Advance only after BOTH verification and symbol probes have succeeded.
-    record cbm ok "verified refresh or unchanged inputs" "$(jget "$WORK/cbm_v.json" nodes)" "$(jget "$WORK/cbm_v.json" edges)"
-    record graphify ok "verified refresh or unchanged inputs" "$(jget "$WORK/gfy_v.json" nodes)" "$(jget "$WORK/gfy_v.json" edges)"
+    # Success is reported only after both writes returned 0 AND the state file read back from disk holds both indexes fresh (#57).
+    PERSIST_FAIL=""
+    if ! record cbm ok "verified refresh or unchanged inputs" "$(jget "$WORK/cbm_v.json" nodes)" "$(jget "$WORK/cbm_v.json" edges)"; then
+      PERSIST_FAIL="the cbm baseline write failed; no baseline was advanced"
+    elif ! record graphify ok "verified refresh or unchanged inputs" "$(jget "$WORK/gfy_v.json" nodes)" "$(jget "$WORK/gfy_v.json" edges)"; then
+      PERSIST_FAIL="the graphify baseline write failed; the cbm baseline was advanced, so the state is partially updated"
+    elif ! "$PY" "$HELPER" verify-recorded --state-dir "$STATE_DIR" --scan-file "$WORK/scan.json" > "$WORK/rec_v.json" 2>>"$LOG"; then
+      PERSIST_FAIL="the recorded baseline could not be read back as fresh: $(cat "$WORK/rec_v.json" 2>/dev/null)"
+    fi
+    if [ -n "$PERSIST_FAIL" ]; then log "RESULT: BASELINE_NOT_PERSISTED ($PERSIST_FAIL)"; exit 4; fi
     if [ "$NEED_CBM" != "True" ] && [ "$NEED_GFY" != "True" ]; then log "RESULT: NO_CHANGE"; else log "RESULT: INDEX_REFRESHED"; fi
     exit 0 ;;
   *) log "RESULT: INDEX_STATUS_NOT_FRESH (cbm=$CBM_RESULT graphify=$GFY_RESULT) - baseline NOT advanced for failed index"; exit 2 ;;

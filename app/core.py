@@ -16,21 +16,25 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 import functools
+import itertools
 import json
 import math
 import re
 import sys
+import unicodedata
 from typing import Mapping
 import pint
 
 UNITS = pint.UnitRegistry(autoconvert_offset_to_baseunit=True)
 
-_NUM = r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)"
+# ASCII digits only (#56): Python's \d and float() also accept other decimal digits (Arabic-Indic, full-width ...). A number in such a script
+# could underflow to 0.0 unseen by the ASCII underflow guard, so it is not part of the grammar; the row is reported instead (UNPARSED_ROW).
+_NUM = r"[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)"
 _UNIT = r"[A-Za-z°µμ][\w°µμ/%^.*-]*"
 ENTRY = re.compile(
     r"^\s*\|?\s*(?P<tag>[A-Za-z][\w-]{1,31})\s*\|\s*"
     r"(?P<field>[A-Za-z][\w -]{1,47})\s*\|\s*"
-    r"(?P<value>[+-]?(?:\d+(?:\.\d+)?|\.\d+))\s*"
+    r"(?P<value>[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+))\s*"
     r"(?P<unit>[A-Za-z°µμ][\w°µμ/%^.*-]*)\s*\|?\s*$"
 )
 CSV_ENTRY = re.compile(
@@ -70,8 +74,17 @@ _AMBIGUOUS_CANONICAL = {"gallon": "gallon", "quart": "quart", "pint": "pint", "c
                         "british_thermal_unit": "btu", "ton": "ton", "barrel": "barrel"}
 
 # --- D05: temperature differences are not absolute temperatures ---
-_INTERVAL_WORDS = {"delta", "difference", "differential", "diff", "rise", "drop", "interval", "dt"}
-_ABSOLUTE_WORDS = {"temperature", "temp"}
+# FINAL-RT-003 (#53): the kind of a temperature comes from a finite label grammar, never from one word somewhere in a longer name.
+#   absolute label: every word is `temperature`/`temp` or a listed qualifier, and at least one is `temperature`/`temp`
+#   interval label: every word is `temperature`/`temp`/`t`/`delta`, a qualifier or a difference word, and at least one is a
+#                   difference word (difference, differential, rise, drop, delta, interval)
+#   anything else (uncertainty, deviation, margin, error, superheat, DT, diff, "of", unknown words ...) is UNKNOWN.
+# A delta_ unit decides the kind by itself. An unknown kind is not compared when an offset unit (degC, degF) is involved.
+_TEMPERATURE_NOUNS = frozenset({"temperature", "temp"})
+_INTERVAL_HEADS = frozenset({"delta", "difference", "differential", "rise", "drop", "interval"})
+_TEMPERATURE_QUALIFIERS = frozenset({
+    "design", "operating", "operation", "ambient", "maximum", "max", "minimum", "min", "normal", "nominal", "rated", "working",
+    "process", "inlet", "outlet", "supply", "return", "setpoint", "set", "point", "storage", "test", "service"})
 _OFFSET_TO_DELTA = {"degree_Celsius": "delta_degC", "degree_Fahrenheit": "delta_degF"}
 MAX_CHARS = 200_000
 MAX_LINES = 5_000
@@ -92,6 +105,98 @@ _EXCERPT_CHARS = 200
 ZERO_TOLERANCE_FLOOR = 1e-12
 _TINY = sys.float_info.min   # smallest normal double; a nonzero value below this has lost precision and is not compared
 SCOPE = "Structured rows only; not a general PDF/P&ID semantic audit"
+
+# --- FR-01 (#45): bounded unit-expression syntax. Checked BEFORE any text reaches Pint. ---
+# Pint evaluates the unit text as an expression. A chained exponent such as `m^9^9^9` makes it compute a huge integer power
+# and can keep one audit busy for a very long time (it holds the interpreter lock). This guard is a small lexical grammar,
+# not a blacklist of one string:
+#   unit  := term (("*" | "/") term)*                      at most MAX_UNIT_TERMS terms, at most MAX_UNIT_CHARS characters
+#   term  := name [ ("^" | "**") exponent | digits ]       at most ONE exponent per term; digits = implicit exponent (m2, m\u00b2)
+#   name  := letters, "_", "%", degree, micro and ohm signs (no ASCII or other digits, no spaces, no brackets)
+#   exponent := [+-] 1-2 ASCII digits [ "." 1-9 ASCII digits ]   a literal, never an expression
+# So no exponent can contain another exponent, and every exponent is a short literal. Anything else is refused with a stable
+# code. The scan is linear in the length. This is bounded syntactic rejection; it is not a claim of immunity against every
+# possible slow input.
+MAX_UNIT_CHARS = 64
+MAX_UNIT_TERMS = 8
+_ASCII_DIGITS = "0123456789"
+_SUPERSCRIPT_DIGITS = "\u2070\u00b9\u00b2\u00b3\u2074\u2075\u2076\u2077\u2078\u2079"   # m\u00b2, kg/m\u00b3
+_SUPERSCRIPT_SIGNS = "\u207a\u207b"
+_UNIT_NAME_SYMBOLS = "_\u00b0\u00b5\u03bc\u03a9%"
+
+
+def _scan_unit_name(unit: str, pos: int) -> int:
+    end = pos
+    while end < len(unit) and (unit[end].isalpha() or unit[end] in _UNIT_NAME_SYMBOLS):
+        end += 1
+    return end
+
+
+def _scan_exponent_literal(unit: str, pos: int):
+    """End of an exponent literal that starts at pos, or None when there is none."""
+    n, i = len(unit), pos
+    if i < n and unit[i] in "+-":
+        i += 1
+    start = i
+    while i < n and unit[i] in _ASCII_DIGITS and i - start < 2:
+        i += 1
+    if i == start:
+        return None
+    if i + 1 < n and unit[i] == "." and unit[i + 1] in _ASCII_DIGITS:
+        j = i + 1
+        while j < n and unit[j] in _ASCII_DIGITS and j - (i + 1) < 9:
+            j += 1
+        i = j
+    return i
+
+
+def unit_syntax_problem(unit):
+    """None when the unit text is inside the bounded grammar above, else a stable code:
+    EMPTY, TOO_LONG, TOO_MANY_TERMS, BAD_SYNTAX, BAD_EXPONENT, CHAINED_EXPONENT, EXPONENT_TOO_LARGE.
+    Pure text scan. It never calls Pint."""
+    if not isinstance(unit, str) or not unit:
+        return "EMPTY"
+    n = len(unit)
+    if n > MAX_UNIT_CHARS:
+        return "TOO_LONG"
+    pos, terms = 0, 0
+    while True:
+        end = _scan_unit_name(unit, pos)
+        if end == pos:
+            return "BAD_SYNTAX"
+        terms += 1
+        if terms > MAX_UNIT_TERMS:
+            return "TOO_MANY_TERMS"
+        pos, has_exponent = end, False
+        operator = 1 if unit.startswith("^", pos) else 2 if unit.startswith("**", pos) else 0
+        if operator:
+            end = _scan_exponent_literal(unit, pos + operator)
+            if end is None:
+                return "BAD_EXPONENT"
+            pos, has_exponent = end, True
+        elif pos < n and unit[pos] in _ASCII_DIGITS:        # implicit exponent: m2
+            end = pos
+            while end < n and unit[end] in _ASCII_DIGITS and end - pos < 2:
+                end += 1
+            pos, has_exponent = end, True
+        elif pos < n and unit[pos] in _SUPERSCRIPT_DIGITS + _SUPERSCRIPT_SIGNS:       # superscript exponent: m\u00b2, m\u207b\u00b2
+            end = pos + (1 if unit[pos] in _SUPERSCRIPT_SIGNS else 0)
+            start = end
+            while end < n and unit[end] in _SUPERSCRIPT_DIGITS and end - start < 2:
+                end += 1
+            if end == start:
+                return "BAD_EXPONENT"
+            pos, has_exponent = end, True
+        if pos == n:
+            return None
+        if unit[pos] == "^" or unit.startswith("**", pos):
+            return "CHAINED_EXPONENT" if has_exponent else "BAD_EXPONENT"
+        if unit[pos] in _ASCII_DIGITS or unit[pos] in _SUPERSCRIPT_DIGITS:
+            return "EXPONENT_TOO_LARGE"
+        if unit[pos] in "*/":
+            pos += 1
+            continue
+        return "BAD_SYNTAX"
 
 
 @dataclass(frozen=True)
@@ -122,15 +227,20 @@ class NumericRangeError(ValueError, ArithmeticError):
 def relative_difference(a: float, b: float) -> float:
     """|a-b| / max(|a|,|b|) without overflow or underflow of the intermediate results. Inputs must be finite.
 
-    Both values are first divided by the larger magnitude, so every intermediate is within [-1, 1]. The result is in
-    [0, 2]: 0 for equal values (including 0 and 0), 1 for a zero against a nonzero value and 2 for opposite signs.
+    Same-sign values: |a - b| / max(|a|, |b|). Otherwise both values are first divided by the larger magnitude, so every
+    intermediate is within [-1, 1]. The result is in [0, 2]: 0 for equal values (including 0 and 0), 1 for a zero against a
+    nonzero value and 2 for opposite signs. Tested against an exact rational oracle (tests/test_final_rt_numeric_boundary.py).
     """
     if not (math.isfinite(a) and math.isfinite(b)):
         raise NumericRangeError("non-finite value")
     scale = max(abs(a), abs(b))
     if scale == 0.0:
         return 0.0
-    return abs(a / scale - b / scale)
+    if (a > 0.0 and b > 0.0) or (a < 0.0 and b < 0.0):
+        # Same sign: |a - b| <= max(|a|, |b|), so the difference cannot overflow, and one division gives the correctly rounded
+        # quotient. 99 against 100 is exactly 0.01 and therefore inside a 1 % limit (FINAL-RT-004, #54).
+        return abs(a - b) / scale
+    return abs(a / scale - b / scale)       # opposite signs or a zero: 1 to 2; scaling first keeps |a| + |b| from overflowing
 
 
 def reported_difference(error: float) -> float:
@@ -271,7 +381,14 @@ def _unit_like_raw(cell: str) -> bool:
     """True when the RAW cell is a unit the engine knows, refuses as ambiguous, a gauge/absolute pressure spelling, or the omega sign."""
     if not _UNIT_TOKEN.fullmatch(cell):
         return False
-    if cell == "\u03a9" or _PRESSURE_BASIS_UNIT.fullmatch(cell) or ambiguous_unit(cell):
+    if cell == "\u03a9" or _PRESSURE_BASIS_UNIT.fullmatch(cell):
+        return True
+    if unit_syntax_problem(cell):
+        # FR-01: outside the grammar, Pint is never asked. An exponent-shaped token is still a unit column, so that the
+        # row beside it is reported (UNPARSED_ROW) and not taken for prose; other refused shapes (for example a hyphenated
+        # word) are not units.
+        return "^" in cell or "**" in cell
+    if ambiguous_unit(cell):
         return True
     try:
         UNITS.Quantity(1, ALIASES.get(cell, cell))
@@ -387,22 +504,189 @@ def ambiguous_unit(unit: str):
     return None
 
 
-def _words(text: str) -> set:
-    spaced = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)          # dT -> d T ; deltaT -> delta T
-    return {w.lower() for w in re.findall(r"[A-Za-z]+", spaced)} | {w.lower() for w in re.findall(r"[A-Za-z]+", text)}
+def _label_tokens(text: str) -> list:
+    """Lower-case words of a property name, in order. camelCase and separators split words: `deltaT` -> delta, t."""
+    return [w.lower() for w in re.findall(r"[A-Za-z]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", text))]
+
+
+# FROZEN-RT-001 (#60): the row grammar lets a property name hold any Unicode word character, but the label grammar reads ASCII
+# letters only. A character it cannot read (a Greek delta, an accented or look-alike letter, a digit) used to disappear from the
+# tokens, and the rest of the name then looked like a clear label. Now the whole name must be ASCII letters, spaces, `_` or `-`;
+# otherwise the kind is unknown. Nothing is deleted, transliterated or guessed.
+_LABEL_CHARS = re.compile(r"[A-Za-z _-]+")
 
 
 def _temperature_kind(base_names: list, field: str) -> str:
-    """Classify a pure-temperature quantity from its unit and its property name."""
-    words = _words(field)
-    interval_property = bool(words & _INTERVAL_WORDS)
+    """Classify a pure-temperature quantity from its unit and its property name (grammar above)."""
     if any(n.startswith("delta_") for n in base_names):
+        return "interval"                                   # explicit unit: delta_degC, delta_degF
+    if not _LABEL_CHARS.fullmatch(field):
+        return "unknown"
+    tokens = _label_tokens(field)
+    words = set(tokens)
+    if words & _INTERVAL_HEADS and words <= _INTERVAL_HEADS | _TEMPERATURE_NOUNS | _TEMPERATURE_QUALIFIERS | {"t"}:
         return "interval"
-    if any(n in _OFFSET_TO_DELTA for n in base_names):
-        return "interval" if interval_property else "absolute"
-    if interval_property:
-        return "interval"
-    return "absolute" if words & _ABSOLUTE_WORDS else "unknown"
+    if words & _TEMPERATURE_NOUNS and words <= _TEMPERATURE_NOUNS | _TEMPERATURE_QUALIFIERS:
+        return "absolute"
+    return "unknown"
+
+
+def _csv_quote_blocks(lines: list) -> dict:
+    """{opening line number: {"end": last line number, "unclosed": bool}} for every quoted CSV field that spans physical lines.
+
+    A linear scan with the rules of Python's csv module (default dialect): a quote opens a quoted field only at the start of a
+    field, `""` inside quotes is an escaped quote, a quote in the middle of an unquoted field is literal, and a line break inside
+    quotes belongs to the field. Only lines that contain a quote, or lie inside an open quoted field, are scanned character by
+    character, and each character is visited once. It never builds a per-record string (FROZEN-RT-002, #61)."""
+    blocks, in_quotes, start = {}, False, 0
+    for number, raw in enumerate(lines, 1):
+        if not in_quotes and '"' not in raw:
+            continue
+        at_start, i, n = not in_quotes, 0, len(raw)
+        while i < n:
+            c = raw[i]
+            if in_quotes:
+                if c == '"':
+                    if i + 1 < n and raw[i + 1] == '"':
+                        i += 2
+                        continue
+                    in_quotes, at_start = False, False
+                    if number != start:
+                        blocks[start] = {"end": number, "unclosed": False}
+            elif c == ",":
+                at_start = True
+            elif c == '"' and at_start:
+                in_quotes, at_start, start = True, False, number
+            else:
+                at_start = False
+            i += 1
+    if in_quotes:
+        blocks[start] = {"end": len(lines), "unclosed": True}
+    return blocks
+
+
+def _merge_quote_blocks(blocks: dict) -> dict:
+    """Quoted fields of ONE logical record share a physical line (the line where field A closes also opens field B), so their
+    line ranges overlap. Merge each such chain into one region: one warning, truthful opening and closing line. The scan above
+    yields blocks in ascending order, so this is a single pass."""
+    regions, current = {}, None
+    for start in sorted(blocks):
+        block = blocks[start]
+        if current is not None and start <= regions[current]["end"]:
+            region = regions[current]
+            region["end"] = max(region["end"], block["end"])
+            region["unclosed"] = region["unclosed"] or block["unclosed"]
+        else:
+            current = start
+            regions[start] = {"end": block["end"], "unclosed": block["unclosed"]}
+    return regions
+
+
+_CELL_LIMIT = 64   # the part of a cell that follows its leading padding and qualifiers: a number and a unit fit well inside it
+_MAX_RECORD_FIELDS = 256   # a quoted record with more fields is not inspected; it is reported (fail closed), like a line over the guard
+_QUALIFIER_SYMBOLS = "~\u2248<>\u2264\u2265\u00b1+-\u2212="
+_QUALIFIER_WORDS = ("approximately", "approx", "nominal", "typical", "about", "max", "min", "nom", "typ", "ca")   # as in _QUALIFIER
+
+
+def _cell_shape(cell: str) -> str:
+    """A field as the cell patterns should see it (FINAL74-RT-001, #65): the padding in front of a value must not decide whether the
+    value is seen. One linear pass skips leading whitespace, invisible format characters, qualifier marks (~ < > + - and so on) and
+    qualifier words (max, min, approx ...); any skipped qualifier becomes a single `~ `. Only then is the first _CELL_LIMIT
+    characters of the REST taken. So `+` followed by 5 or 500 spaces and `999 bar` give the same text, and a long run of
+    qualifier marks cannot push the number out of view. A cell that is prose still begins with a word, never with a number."""
+    n, i, qualified = len(cell), 0, False
+    while i < n:
+        c = cell[i]
+        if c.isspace() or unicodedata.category(c) == "Cf":
+            i += 1
+        elif c in _QUALIFIER_SYMBOLS:
+            i, qualified = i + 1, True
+        else:
+            low = cell[i:i + 14].lower()
+            for word in _QUALIFIER_WORDS:
+                end = i + len(word)
+                if low.startswith(word) and not (end < n and cell[end].isalpha()):
+                    i, qualified = end + (1 if end < n and cell[end] == "." else 0), True
+                    break
+            else:
+                break
+    return ("~ " if qualified else "") + cell[i:i + _CELL_LIMIT].rstrip()
+
+
+def _csv_record_fields(record_lines: list, joiner: str = " ") -> list:
+    """Fields of ONE logical CSV record, with the quote rules of _csv_quote_blocks. A line break inside a quoted field becomes
+    `joiner` (a space, or nothing, so that a word or number cut by the line break is read whole). Linear: each character is
+    visited once and the pieces of a field are joined once."""
+    fields, parts, in_quotes, at_start = [], [], False, True
+    for index, raw in enumerate(record_lines):
+        if index and in_quotes and joiner:
+            parts.append(joiner)
+        i, n = 0, len(raw)
+        while i < n:
+            c = raw[i]
+            if in_quotes:
+                if c == '"':
+                    if i + 1 < n and raw[i + 1] == '"':
+                        parts.append('"')
+                        i += 2
+                        continue
+                    in_quotes, at_start = False, False
+                else:
+                    parts.append(c)
+            elif c == ",":
+                fields.append("".join(parts))
+                parts, at_start = [], True
+            elif c == '"' and at_start:
+                in_quotes, at_start = True, False
+            else:
+                parts.append(c)
+                at_start = False
+            i += 1
+    fields.append("".join(parts))
+    return fields
+
+
+def _csv_block_needs_warning(lines: list, start: int, block: dict) -> bool:
+    """A quoted multi-line region is ONE logical CSV record (FINAL0673-RT-001, #63). It is reported when
+      - the quote never closes, or
+      - a physical line of it is measurement-like on its own or too long to inspect (a row hidden inside a note), or
+      - the LOGICAL record is measurement-shaped by the cell rules of a one-line unsupported row: a number (or number and unit)
+        from the third field on, or a bare number after a unit field. This catches a record whose parts are spread over
+        several lines, so that no single physical line looks like a row.
+    A note of plain words is silent, as a one-line note is. Quoted values are never compared. Every cell is cut to a short
+    prefix before a pattern runs, and the whole region is read once, so the work stays linear in the size of the region.
+    What it does NOT do: a number that is not at the start of a field is not found (a note that merely mentions a number stays
+    silent), and a field is never judged by its length or by where in the record it stands: padding, qualifiers and the length of
+    an unrelated note cannot change the answer. What cannot be inspected within the guards is reported, not skipped."""
+    if block["unclosed"]:
+        return True
+    record_lines = lines[start - 1:block["end"]]
+    for raw in record_lines:
+        if len(raw) > MAX_LINE_CHARS:
+            return True
+        if raw.strip() and (ENTRY.fullmatch(raw) or CSV_ENTRY.fullmatch(raw) or _looks_like_row(raw, True)):
+            return True
+    for joiner in (" ", ""):                    # a break may cut a word or a number: read the record both ways
+        fields = _csv_record_fields(record_lines, joiner)
+        if len(fields) > _MAX_RECORD_FIELDS:    # too many fields to inspect: reported, never silently complete
+            return True
+        cells = [_cell_shape(c) for c in fields]
+        if _has_measurement_cell(cells):
+            return True
+        if len(cells) >= 3 and _NUMBER_START.match(cells[2]):
+            return True
+        for field in fields:                    # a row folded INSIDE one quoted field (`"P-9 | pressure |<break>999 bar"`)
+            if "," in field or "|" in field:
+                if len(field) > MAX_LINE_CHARS:  # a delimiter-bearing text over the line guard is not read (as LINE_TOO_LONG)
+                    return True
+                text = field.strip()
+                if ENTRY.fullmatch(text) or CSV_ENTRY.fullmatch(text) or _looks_like_row(text, True):
+                    return True
+    if sum(len(raw) for raw in record_lines) + len(record_lines) <= MAX_LINE_CHARS:      # a short record read as one line
+        for flat in (" ".join(record_lines), "".join(record_lines)):
+            if ENTRY.fullmatch(flat) or CSV_ENTRY.fullmatch(flat) or _looks_like_row(flat, True):
+                return True
+    return False
 
 
 def _parse(name: str, text: str):
@@ -416,7 +700,22 @@ def _parse(name: str, text: str):
     warnings: list[dict] = []
     coverage = {"lines": len(lines), "rows_parsed": 0, "rows_unsupported_unit": 0, "rows_ambiguous_unit": 0, "rows_unparsed": 0,
                 "rows_too_long": 0}
+    blocks = _merge_quote_blocks(_csv_quote_blocks(lines)) if csv_file and '"' in text else {}
+    inside_quotes = {n for start, b in blocks.items() for n in range(start + 1, b["end"] + 1)}   # never given to the row grammar
     for line_number, raw in enumerate(lines, 1):
+        if line_number in inside_quotes:
+            continue                       # part of a quoted CSV field that began on an earlier line (#61)
+        block = blocks.get(line_number)
+        if block and _csv_block_needs_warning(lines, line_number, block):
+            text_ = raw.strip()
+            coverage["rows_unparsed"] += 1
+            warnings.append({"code": "UNPARSED_ROW", "document": name, "line": line_number, "end_line": block["end"],
+                             "excerpt": text_[:_EXCERPT_CHARS] + ("\u2026" if len(text_) > _EXCERPT_CHARS else ""),
+                             "reason": (f"a quoted CSV field opens here and is never closed; the rest of the file (to line {block['end']}) was not compared"
+                                        if block["unclosed"] else
+                                        f"quoted CSV text spans lines {line_number} to {block['end']} and contains measurement-like text; none of it was compared"),
+                             "detail": "UNCLOSED_QUOTE" if block["unclosed"] else "MULTILINE_QUOTED_FIELD"})
+            continue
         if not raw.strip():
             continue                       # ingress: a blank line is never a row (linear time, no regular expression)
         if "|" not in raw and "," not in raw:
@@ -438,10 +737,15 @@ def _parse(name: str, text: str):
                 coverage["rows_unparsed"] += 1
                 quoted = any(q in raw for q in _QUOTE_CHARS)
                 comma_outside_csv = not csv_file and "," in raw and "|" not in raw
-                warnings.append({"code": "UNPARSED_ROW", "document": name, "line": line_number, "excerpt": raw.strip(),
-                                 "reason": ("row uses quoted fields, which are not supported; it was not compared" if quoted
-                                            else "comma-separated rows are read only from .csv files; it was not compared" if comma_outside_csv
-                                            else "row does not match the supported format")})
+                non_ascii_digits = any(unicodedata.category(ch) == "Nd" and ch not in _ASCII_DIGITS for ch in raw)
+                warning = {"code": "UNPARSED_ROW", "document": name, "line": line_number, "excerpt": raw.strip(),
+                           "reason": ("row uses non-ASCII decimal digits, which are not supported; it was not compared" if non_ascii_digits
+                                      else "row uses quoted fields, which are not supported; it was not compared" if quoted
+                                      else "comma-separated rows are read only from .csv files; it was not compared" if comma_outside_csv
+                                      else "row does not match the supported format")}
+                if non_ascii_digits:
+                    warning["detail"] = "NON_ASCII_DIGITS"
+                warnings.append(warning)
             continue
         tag, field = match["tag"], match["field"].strip()
         value, unit = float(match["value"]), match["unit"]
@@ -451,6 +755,12 @@ def _parse(name: str, text: str):
             value_error = NumericRangeError("a number is too large to represent")
         else:
             value_error = None
+        syntax = unit_syntax_problem(unit)
+        if syntax:                         # FR-01: Pint is not called for unit text outside the bounded grammar
+            coverage["rows_unsupported_unit"] += 1
+            warnings.append({"code": "UNSUPPORTED_UNIT", "document": name, "line": line_number, "excerpt": raw.strip(),
+                             "reason": "UnitSyntaxError", "detail": syntax})
+            continue
         ambiguous = ambiguous_unit(unit)
         if ambiguous:
             word, alternatives = ambiguous
@@ -468,6 +778,9 @@ def _parse(name: str, text: str):
             kind = ""
             if str(quantity.dimensionality) == "[temperature]":
                 names = [n for n, _ in quantity.unit_items()]
+                for scale in names:
+                    if not _temperature_scale_supported(scale):
+                        raise UnsupportedTemperatureScale(scale)           # before any base-unit conversion
                 kind = _temperature_kind(names, field)
                 if kind == "interval" and any(n in _OFFSET_TO_DELTA for n in names):
                     quantity = UNITS.Quantity(value, _OFFSET_TO_DELTA[names[0]])     # a rise of 5 degC is 5 K, not 278.15 K
@@ -483,10 +796,13 @@ def _parse(name: str, text: str):
             key = dimension_key(quantity.dimensionality)
         except Exception as exc:  # any parser/conversion failure means: unit not usable, never a pass
             coverage["rows_unsupported_unit"] += 1
-            warnings.append({
+            refused = {
                 "code": "UNSUPPORTED_UNIT", "document": name, "line": line_number,
                 "excerpt": raw.strip(), "reason": type(exc).__name__,
-            })
+            }
+            if isinstance(exc, UnsupportedTemperatureScale):
+                refused.update(detail="TEMPERATURE_SCALE_NOT_SUPPORTED", scale=exc.scale)
+            warnings.append(refused)
             continue
         coverage["rows_parsed"] += 1
         records.append(Observation(name, line_number, tag, field, value, unit, numeric,
@@ -506,17 +822,92 @@ def source_name(document: str) -> str:
     return base if sep and page.isdigit() else document
 
 
-def _temperature_pair(ref: Observation, other: Observation):
-    """D05. Returns None when the pair may be compared, else (detail, message)."""
-    if ref.dimension != "[temperature]":
+_TEMPERATURE_MESSAGES = {
+    "interval_vs_absolute": "One value is a temperature difference and the other is an absolute temperature. They are not comparable.",
+    "uncertain": "One value is a temperature difference. The other (for example a plain K) could be a temperature or a difference. "
+                 "Name the property 'temperature difference' or use delta_degC to make the meaning explicit.",
+    "unknown_kind": "The kind of at least one temperature is not clear (absolute temperature or temperature difference), and a degC or "
+                    "degF value converts differently in each case. Use delta_degC or delta_degF for a difference, or name the property "
+                    "'temperature' for an absolute temperature. Abbreviations such as DT and terms such as superheat do not decide the kind.",
+}
+
+
+# FINAL-RT-002 (#52): the pure-temperature units SpecForge reads. Everything else of the temperature dimension (degree_Reaumur and
+# its delta, Planck or atomic temperature units, prefixed offset units) is refused BEFORE conversion to base units, because
+# Pint can convert an offset scale without SpecForge having a tested rule for its absolute and interval meaning.
+#   linear: kelvin (with SI prefixes), degree_Rankine, delta_degree_Celsius, delta_degree_Fahrenheit
+#   offset: degree_Celsius, degree_Fahrenheit (absolute; as an interval they are converted through the delta_ units)
+SUPPORTED_TEMPERATURE_SCALES = frozenset({"kelvin", "degree_Rankine", "degree_Celsius", "degree_Fahrenheit",
+                                          "delta_degree_Celsius", "delta_degree_Fahrenheit"})
+
+
+class UnsupportedTemperatureScale(ValueError):
+    """A unit of the temperature dimension outside SUPPORTED_TEMPERATURE_SCALES. The row is reported, never converted."""
+
+    def __init__(self, scale: str):
+        super().__init__(f"temperature scale {scale} is not supported")
+        self.scale = scale
+
+
+def _temperature_scale_supported(name: str) -> bool:
+    return name in SUPPORTED_TEMPERATURE_SCALES or any(base == "kelvin" for _, base, _ in UNITS.parse_unit_name(name))
+
+
+@functools.lru_cache(maxsize=256)
+def _has_offset_unit(unit: str) -> bool:
+    """True for degC and degF (offset scales). Fails closed (True) when the unit text cannot be read."""
+    if unit_syntax_problem(unit):
+        return True
+    try:
+        names = {name for name, _ in UNITS.Quantity(1, ALIASES.get(unit, unit)).unit_items()}
+    except Exception:
+        return True
+    return bool(names & set(_OFFSET_TO_DELTA))
+
+
+def _temperature_group_problem(records):
+    """D05, H2-001, FR-03. For records of one tag+property that share the temperature dimension, return
+    (detail, message, first, second) for a pair that must not be compared, else None. O(n), and equal to checking every pair:
+      - an interval beside an absolute temperature, or beside an unknown kind, is never comparable;
+      - an unknown kind is comparable only when no offset unit (degC, degF) is involved, or when value and unit are identical
+        (identical text gives the same answer under every reading).
+    The two returned records are listed in the order of `records`."""
+    if not records or any(r.dimension != "[temperature]" for r in records):
         return None
-    kinds = {ref.quantity_kind, other.quantity_kind}
-    if kinds == {"interval", "absolute"}:
-        return ("interval_vs_absolute", "One value is a temperature difference and the other is an absolute temperature. They are not comparable.")
-    if "interval" in kinds and "unknown" in kinds:
-        return ("uncertain", "One value is a temperature difference. The other (for example a plain K) could be a temperature or a difference. "
-                             "Name the property 'temperature difference' or use delta_degC to make the meaning explicit.")
+    first_of = {}
+    for record in records:
+        first_of.setdefault(record.quantity_kind, record)
+    position = {id(record): index for index, record in enumerate(records)}
+
+    def found(detail, a, b):
+        a, b = sorted((a, b), key=lambda r: position[id(r)])
+        return detail, _TEMPERATURE_MESSAGES[detail], a, b
+
+    interval = first_of.get("interval")
+    if interval is not None:
+        if "absolute" in first_of:
+            return found("interval_vs_absolute", interval, first_of["absolute"])
+        if "unknown" in first_of:
+            return found("uncertain", interval, first_of["unknown"])
+    unknowns = [r for r in records if r.quantity_kind == "unknown"]
+    if unknowns:
+        unknown_offset = next((u for u in unknowns if _has_offset_unit(u.unit)), None)
+        if unknown_offset is not None:
+            differing = next((r for r in records if r is not unknown_offset
+                              and (r.value, r.unit) != (unknown_offset.value, unknown_offset.unit)), None)
+            if differing is not None:
+                return found("unknown_kind", unknown_offset, differing)
+        unknown_linear = next((u for u in unknowns if not _has_offset_unit(u.unit)), None)
+        offset_record = next((r for r in records if _has_offset_unit(r.unit)), None)
+        if unknown_linear is not None and offset_record is not None:
+            return found("unknown_kind", unknown_linear, offset_record)
     return None
+
+
+def _temperature_pair(ref: Observation, other: Observation):
+    """Returns None when the pair may be compared, else (detail, message)."""
+    problem = _temperature_group_problem([ref, other])
+    return problem[:2] if problem else None
 
 
 # Authoritative audit verdicts. `status` below keeps the original comparison outcome; `verdict` is what consumers
@@ -592,9 +983,7 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
         for record in records:
             by_source[source_name(record.document)].append(record)
         ambiguous = False
-        representatives: list[Observation] = []
         for source, same in by_source.items():
-            representatives.append(same[0])
             if len(same) == 1:
                 continue
             first, consistent = same[0], True
@@ -619,6 +1008,29 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
                     findings.append({"code": "INTERNAL_CONTRADICTION", "scope": "same_source", "tag": tag, "field": field,
                                      "relative_difference": reported_difference(error),
                                      "reference": asdict(first), "other": asdict(other)})
+            # FR-02 (#46): a repeat that is close to the FIRST row can still contradict another repeat (approximate equality
+            # is not transitive). Every pair must be compatible, not only each repeat with the first one.
+            if consistent:
+                problem = _temperature_group_problem(same)       # a pair that does not include the first row
+                if problem:
+                    consistent = False
+                    group_warnings.append({"code": "TEMPERATURE_SEMANTICS", "scope": "same_source", "detail": problem[0],
+                                           "message": problem[1], "tag": tag, "field": field,
+                                           "reference": asdict(problem[2]), "other": asdict(problem[3])})
+            if consistent:
+                # Here allowed < 1 (tolerance <= 0.2). Two values of opposite sign, or zero and nonzero, differ by 1 or more,
+                # so they are always inconsistent, and the minimum and maximum are such a pair whenever the group is not
+                # strictly one-signed. In a one-signed group the relative difference 1 - (smaller / larger magnitude) is
+                # largest for the smallest and largest magnitude, that is for the minimum and the maximum. So the group is
+                # consistent exactly when the minimum and the maximum are within the allowed difference. O(n).
+                low, high = min(same, key=lambda r: r.si_value), max(same, key=lambda r: r.si_value)
+                error = relative_error(low, high)
+                if error > allowed:
+                    consistent = False
+                    low, high = sorted((low, high), key=lambda r: same.index(r))
+                    findings.append({"code": "INTERNAL_CONTRADICTION", "scope": "same_source", "tag": tag, "field": field,
+                                     "relative_difference": reported_difference(error),
+                                     "reference": asdict(low), "other": asdict(high)})
             group_warnings.append({
                 "code": "DUPLICATE_IDENTIFIER", "document": source, "tag": same[0].tag, "field": same[0].field,
                 "lines": [r.line for r in same], "excerpts": [r.excerpt for r in same],
@@ -640,18 +1052,29 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
                 "reason": "a source contradicts itself, so no value can represent it",
             })
             continue
-        reference = representatives[0]
-        for other in representatives[1:]:
+        # FINAL-RT-001 (#51): the first row of a source does not stand for the source. Every source group here is internally
+        # consistent, so two groups agree exactly when the four pairs of extremes (min/max of one group against min/max of
+        # the other) are within the allowed difference. Same sign: the difference 1 - smaller/larger grows with the distance of
+        # the magnitudes, so the worst partner of any value is the minimum or the maximum of the other group. Opposite signs or
+        # a zero against a nonzero value differ by 1 or more (allowed is at most 0.2), and the extremes contain such a pair
+        # whenever one exists. The worst pair is the evidence; ties keep the first rows, so single-row sources are unchanged.
+        groups = list(by_source.values())
+        for other_group in groups[1:]:
+            reference, other = groups[0][0], other_group[0]
             if reference.dimensionality != other.dimensionality:
                 group_warnings.append({"code": "DIMENSION_MISMATCH", "tag": tag, "field": field,
                                        "reference": asdict(reference), "other": asdict(other)})
                 continue
-            problem = _temperature_pair(reference, other)
+            problem = _temperature_group_problem(groups[0] + other_group)      # every cross pair, as one group
             if problem:
                 group_warnings.append({"code": "TEMPERATURE_SEMANTICS", "detail": problem[0], "message": problem[1],
-                                       "tag": tag, "field": field, "reference": asdict(reference), "other": asdict(other)})
+                                       "tag": tag, "field": field, "reference": asdict(problem[2]), "other": asdict(problem[3])})
                 continue
             comparisons += 1
+            extremes_a = (min(groups[0], key=lambda r: r.si_value), max(groups[0], key=lambda r: r.si_value))
+            extremes_b = (min(other_group, key=lambda r: r.si_value), max(other_group, key=lambda r: r.si_value))
+            worst = max([(reference, other), *itertools.product(extremes_a, extremes_b)], key=lambda pair: relative_error(*pair))
+            reference, other = worst
             error = relative_error(reference, other)
             item = {"scope": "cross_source", "tag": tag, "field": field, "relative_difference": reported_difference(error),
                     "reference": asdict(reference), "other": asdict(other)}
@@ -663,7 +1086,7 @@ def audit_documents(documents: Mapping[str, str], tolerance: float = 0.01) -> di
     result = {
         "status": "DIFFERENCES" if findings else ("NO_COMPARABLE_ROWS" if not comparisons else "NO_DIFFERENCES_FOUND"),
         "records": len(all_records), "comparisons": comparisons,
-        "tolerance": tolerance, "findings": findings, "matches": matches,
+        "tolerance": tolerance, "effective_tolerance": allowed, "findings": findings, "matches": matches,
         "unmatched": unmatched, "warnings": warnings, "coverage": coverage,
         "scope": SCOPE,
     }

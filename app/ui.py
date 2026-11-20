@@ -29,7 +29,9 @@ from app.ingest import (  # noqa: E402
 from app.upload_policy import (  # noqa: E402
     PDF_DISABLED_CODE, PDF_DISABLED_MESSAGE, is_pdf_name, pdf_ui_enabled, refused_pdf_names, ui_extensions, ui_formats_text,
 )
-from app.report import VERDICT_CONFLICTS, VERDICT_MATCH, VERDICT_NONE, build_view, escape_md, render_markdown  # noqa: E402
+from app.report import (  # noqa: E402
+    VERDICT_CONFLICTS, VERDICT_MATCH, VERDICT_NONE, allowed_text, build_view, escape_md, render_markdown,
+)
 
 # Two built-in synthetic examples. The example fingerprints are unchanged (same file names and bytes as before).
 EXAMPLES = {
@@ -56,7 +58,7 @@ REASON = {
     "UNMATCHED_RECORD": "Appears in only one document", "UNSUPPORTED_UNIT": "Unit is not supported",
     "LINE_TOO_LONG": "Line is too long to read", "DIMENSION_MISMATCH": "Different physical dimensions",
     "AMBIGUOUS_COMPARISON": "One file gives several values", "DUPLICATE_IDENTIFIER": "Repeated with different values",
-    "TEMPERATURE_SEMANTICS": "Temperature difference against an absolute temperature",
+    "TEMPERATURE_SEMANTICS": "Temperature kind is not clear or not the same",
 }
 READ_AS = {".md": "Markdown", ".txt": "plain text", ".csv": "CSV", ".pdf": "text-based PDF"}
 # Upload policy (app/upload_policy.py). Read on every script run. PDF is off unless SPECFORGE_ENABLE_LOCAL_PDF_UI=1.
@@ -182,7 +184,7 @@ with st.container(horizontal=True, vertical_alignment="bottom", gap="small", key
     source = st.segmented_control("Source · both examples are synthetic", SOURCES, key="source", required=True)
     with st.popover(f"Tolerance {float(ss.get('tol', 1.0)):g} %", key="tol_pop"):
         tol_pct = st.slider("Allowed difference between two values (%)", 0.0, 20.0, 1.0, 0.1, key="tol",
-                            help="Two converted values differ if |A − B| ÷ the larger of |A| and |B| is above this limit.")
+                            help="Two converted values differ if |A − B| ÷ the larger of |A| and |B| is above this limit. A limit of exactly this size is still within. Limits below 1e-10 % are raised to 1e-10 % (rounding floor).")
     with st.popover("Formats & limits", key="limits_pop"):
         st.markdown(
             f"**Supported files:** {ui_formats_text(PDF_UI)}\n\n"
@@ -196,9 +198,14 @@ with st.container(horizontal=True, vertical_alignment="bottom", gap="small", key
             "**Units with more than one meaning are not guessed.** `ton`, `gallon`, `quart`, `pint`, `cal`, `hp`, `Btu` and `bbl` (barrel) "
             "are refused. Write an explicit unit, for example `short_ton`, `long_ton`, `tonne`, `US_liquid_gallon`, "
             "`imperial_gallon`, `thermochemical_calorie`, `metric_horsepower`, `oil_barrel`.\n\n"
-            "**Temperature differences are not absolute temperatures.** `delta_degC` is a difference. A property named "
-            "“temperature difference”, “rise”, “drop” or “delta T” makes `K` and `degC` a difference too. "
-            "A difference and an absolute temperature are never compared.\n\n"
+            "**Temperatures need a clear kind.** `delta_degC` and `delta_degF` are differences. A property named "
+            "“temperature difference”, “rise”, “drop” or “delta T” makes `K` and `degC` a difference too. A property named "
+            "“temperature” or “temp” (with a plain qualifier such as design, operating or ambient) makes them an absolute temperature. "
+            "A difference and an absolute temperature are never compared. A `degC` or `degF` value with any other name (for example "
+            "“DT”, “diff”, “superheat”, “temperature uncertainty” or no label) is not compared with a different value, because the "
+            "conversion depends on the kind. Temperature units other than K, degR, degC and degF (for example Réaumur) are not read.\n\n"
+            "**Unit text** is limited to simple units: at most 64 characters, 8 terms, `*` and `/`, and one short exponent per term "
+            "(`m^2`, `m**2`, `m²`, `s^-1`). Chained exponents and other expressions are not read and are listed as an unsupported unit.\n\n"
             "SpecForge shows where two documents disagree. It does not decide which one is right "
             "and it does not certify a document."
         )
@@ -441,17 +448,26 @@ def _evidence(ev):
     st.code(shown(ev.excerpt), language=None, wrap_lines=True)
 
 
+def _gap_code(gap):
+    """The original row(s) of a gap. Items built from several rows show each one under its own file and location."""
+    if len(getattr(gap, "evidence", ())) > 1:
+        for record in gap.evidence:
+            owned_html(f'<span class="sf-loc"><bdi>{esc(record["document"])}</bdi> · {esc(record["location"])}</span>')
+            st.code(shown(record["excerpt"]), language=None, wrap_lines=True)
+    elif gap.excerpt:
+        st.code(shown(gap.excerpt), language=None, wrap_lines=True)
+
+
 def _difference_line(card, view):
     st.markdown(f"Difference **{md(card.difference or '')}** (difference ÷ the larger value) · allowed "
-                f"**{md(format(view.tolerance * 100, '.10g') + ' %')}**")
+                f"**{md(allowed_text(view.tolerance, view.effective_tolerance))}**")
 
 
 def _gap_line(row):
     if row["kind"] == "gap":
         gap = row["gap"]
         owned_html(f'<b>{esc(REASON.get(gap.code, gap.code))}</b> · <bdi>{esc(gap.location)}</bdi> · <code>{esc(gap.code)}</code>')
-        if gap.excerpt:
-            st.code(shown(gap.excerpt), language=None, wrap_lines=True)
+        _gap_code(gap)
     else:
         issue = row["issue"]
         owned_html(f'<b>Input processing issue</b> · {esc(issue.get("message", ""))} · <code>{esc(issue.get("code", ""))}</code>')
@@ -580,8 +596,7 @@ def inspector(row, view):
         gap = row["gap"]
         st.markdown(f"#### Not compared · {md(REASON.get(gap.code, gap.code))}", anchors=False)
         owned_html(f'Where: <bdi>{esc(gap.location)}</bdi> · code <code>{esc(gap.code)}</code>')
-        if gap.excerpt:
-            st.code(shown(gap.excerpt), language=None, wrap_lines=True)
+        _gap_code(gap)
         st.markdown(md(gap.summary))
         st.caption("No counterpart is paired with this item, and no value, SI form or difference is shown for it, "
                    "because it was not compared.")
@@ -668,8 +683,7 @@ def detailed(audit, rows_all):
             for item in view.notes:
                 st.markdown(md(item.summary))
                 st.caption(md(item.location))
-                if item.excerpt:
-                    st.code(shown(item.excerpt), language=None, wrap_lines=True)
+                _gap_code(item)
     st.caption(UNSEEN)
 
 

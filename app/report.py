@@ -14,7 +14,8 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .ingest import split_document_name
-from .core import UNITS, VERDICT_CONFLICTS, VERDICT_MATCH, VERDICT_NONE, VERDICT_PARTIAL, audit_verdict
+from .core import (UNITS, VERDICT_CONFLICTS, VERDICT_MATCH, VERDICT_NONE, VERDICT_PARTIAL, ZERO_TOLERANCE_FLOOR,
+                   audit_verdict)
 
 PRESSURE_DIMENSION = UNITS.pascal.dimensionality
 
@@ -26,7 +27,7 @@ REASONS = {
     "DUPLICATE_IDENTIFIER": "The same tag and property appear more than once in one document.",
     "DIMENSION_MISMATCH": "The two values have different physical dimensions. They cannot be compared.",
     "AMBIGUOUS_COMPARISON": "One file gives different values for this item, so no single value can be compared with the other file.",
-    "TEMPERATURE_SEMANTICS": "A temperature difference and an absolute temperature cannot be compared.",
+    "TEMPERATURE_SEMANTICS": "The kind of temperature (absolute or difference) is not clear or not the same, so the values were not compared.",
 }
 
 
@@ -75,6 +76,7 @@ class CoverageItem:
     location: str
     excerpt: str = ""
     informational: bool = False   # a note that does not reduce coverage (for example consistent repeats)
+    evidence: list = field(default_factory=list)   # one dict per original row: document, location, excerpt (two-sided and repeat items)
 
 
 @dataclass
@@ -93,6 +95,7 @@ class AuditView:
     scope: str = ""
     tolerance: float = 0.0
     coverage_complete: bool = False   # the authoritative flag (core.audit_verdict), including input issues
+    effective_tolerance: float = 0.0  # enforced allowed difference: max(requested tolerance, 1e-12); `tolerance` is the request
 
 
 # Pint's names for SI base-unit combinations -> the symbols engineers use.
@@ -115,6 +118,13 @@ def fmt_number(x: float) -> str:
 
 def fmt_pct(fraction: float) -> str:
     return format(fraction * 100, ".10g") + " %"
+
+
+def allowed_text(requested: float, effective: float) -> str:
+    """The allowed difference as enforced. When the numeric floor (1e-12 relative) raised the request, both are shown."""
+    if effective == requested:
+        return fmt_pct(effective)
+    return f"{fmt_pct(effective)} (requested {fmt_pct(requested)}; values are never compared more finely than 1e-12)"
 
 
 def describe_location(name: str, line: int) -> str:
@@ -150,7 +160,7 @@ def _label_of(rec: dict, labels: dict) -> str:
     return _doc_label(rec["document"], labels)
 
 
-def _conflict_card(item: dict, labels: dict, tolerance: float) -> ReviewCard:
+def _conflict_card(item: dict, labels: dict, tolerance: float, requested: float) -> ReviewCard:
     ref, oth = item["reference"], item["other"]
     internal = item["code"] == "INTERNAL_CONTRADICTION"
     la, lb = _label_of(ref, labels), _label_of(oth, labels)
@@ -165,9 +175,11 @@ def _conflict_card(item: dict, labels: dict, tolerance: float) -> ReviewCard:
         f"{where} The first row states {_quantity(ref)}. The second row states {_quantity(oth)}. "
         f"Converted to SI ({si_symbol(ref['si_unit'])}): {_si(ref)} and {_si(oth)}. "
         f"The second value is {lower} by {fmt_pct(item['relative_difference'])} "
-        f"(difference divided by the larger value). The allowed difference is {fmt_pct(tolerance)}. "
+        f"(difference divided by the larger value). The allowed difference is {allowed_text(requested, tolerance)}. "
         "SpecForge cannot tell which value is correct."
     )
+    if not internal:
+        explanation += " If a document repeats this item, the pair shown is the one with the largest difference between the two documents."
     if internal:
         explanation += " Because of this, nothing from this file was compared with the other file for this item."
     if UNITS.get_dimensionality(ref["dimension"]) == PRESSURE_DIMENSION:
@@ -177,20 +189,39 @@ def _conflict_card(item: dict, labels: dict, tolerance: float) -> ReviewCard:
         issue, explanation, difference=fmt_pct(item["relative_difference"]))
 
 
-def _equivalent_card(item: dict, labels: dict, tolerance: float) -> ReviewCard:
+def _equivalent_card(item: dict, labels: dict, tolerance: float, requested: float) -> ReviewCard:
     ref, oth = item["reference"], item["other"]
     explanation = (
         f"{_quantity(ref)} and {_quantity(oth)} convert to {_si(ref)} and {_si(oth)}. "
-        f"The difference is {fmt_pct(item['relative_difference'])}, within the allowed {fmt_pct(tolerance)}."
+        f"The difference is {fmt_pct(item['relative_difference'])}, within the allowed {allowed_text(requested, tolerance)}. "
+        "If a document repeats this item, the pair shown is the one with the largest difference, and every other pair is within the allowed difference."
     )
+    same = f"{_quantity(ref)} = {_quantity(oth)}"
+    if item["relative_difference"] > ZERO_TOLERANCE_FLOOR:      # more than rounding noise: not the same value, only within tolerance
+        same = f"{_quantity(ref)} \u2248 {_quantity(oth)} (within tolerance, difference {fmt_pct(item['relative_difference'])})"
     return ReviewCard("equivalent", _title(item), [_evidence(_label_of(ref, labels), ref), _evidence(_label_of(oth, labels), oth)],
                       "No difference beyond the tolerance", explanation, difference=fmt_pct(item["relative_difference"]),
-                      summary=f"{_quantity(ref)} = {_quantity(oth)}")
+                      summary=same)
 
 
 def _plural_lines(w: dict) -> str:
     docs = w.get("documents") or [w["document"]] * len(w["lines"])
     return "; ".join(f"{d}, {describe_location(d, n)}" for d, n in zip(docs, w["lines"]))
+
+
+def _record(document: str, line: int, excerpt: str) -> dict:
+    return {"document": document, "location": describe_location(document, line), "excerpt": excerpt}
+
+
+def _two_rows(a: dict, b: dict) -> tuple:
+    """Location text and one evidence record per original row, in the order the engine gives them."""
+    records = [_record(a["document"], a["line"], a["excerpt"]), _record(b["document"], b["line"], b["excerpt"])]
+    return " / ".join(f"{r['document']}, {r['location']}" for r in records), records
+
+
+def _many_rows(w: dict) -> list:
+    docs = w.get("documents") or [w["document"]] * len(w["lines"])
+    return [_record(d, n, x) for d, n, x in zip(docs, w["lines"], w["excerpts"])]
 
 
 def _coverage_items(result: dict) -> tuple:
@@ -200,31 +231,36 @@ def _coverage_items(result: dict) -> tuple:
         code = w["code"]
         if code == "DIMENSION_MISMATCH":
             a, b = w["reference"], w["other"]
-            loc = f"{describe_location(a['document'], a['line'])} / {describe_location(b['document'], b['line'])}"
+            loc, records = _two_rows(a, b)
             gaps.append(CoverageItem(code, f"{REASONS[code]} ({a['tag']} {a['field']}: {a['unit']} vs {b['unit']})", loc,
-                                     a["excerpt"] + "\n" + b["excerpt"]))
+                                     a["excerpt"] + "\n" + b["excerpt"], evidence=records))
         elif code == "DUPLICATE_IDENTIFIER":
-            kind = ("Repeated with consistent values: the first row represents the file."
+            kind = ("Repeated with consistent values: all repeats agree within the allowed difference, so the file counts as consistent. "
+                    "The comparison with the other file uses its lowest and highest values."
                     if w.get("consistent", False) else "Repeated with different values.")
             item = CoverageItem(code, f"{REASONS[code]} {kind} ({w['tag']} {w['field']})", _plural_lines(w),
-                                "\n".join(w["excerpts"]), informational=bool(w.get("consistent", False)))
+                                "\n".join(w["excerpts"]), informational=bool(w.get("consistent", False)), evidence=_many_rows(w))
             (notes if item.informational else gaps).append(item)
         elif code == "AMBIGUOUS_COMPARISON":
-            gaps.append(CoverageItem(code, f"{REASONS[code]} ({w['tag']} {w['field']})", _plural_lines(w), "\n".join(w["excerpts"])))
+            gaps.append(CoverageItem(code, f"{REASONS[code]} ({w['tag']} {w['field']})", _plural_lines(w), "\n".join(w["excerpts"]),
+                                     evidence=_many_rows(w)))
         elif code == "AMBIGUOUS_UNIT":
             alts = ", ".join(w["alternatives"])
             gaps.append(CoverageItem(code, f"Unit '{w['ambiguous_name']}' has more than one meaning. Write an explicit unit instead: {alts}. The row was not compared.",
                                      f"{w['document']}, {describe_location(w['document'], w['line'])}", w["excerpt"]))
         elif code == "TEMPERATURE_SEMANTICS":
             a, b = w["reference"], w["other"]
-            gaps.append(CoverageItem(code, f"{w['message']} ({a['tag']} {a['field']}: {a['unit']} vs {b['unit']})",
-                                     f"{describe_location(a['document'], a['line'])} / {describe_location(b['document'], b['line'])}",
-                                     a["excerpt"] + "\n" + b["excerpt"]))
+            loc, records = _two_rows(a, b)
+            gaps.append(CoverageItem(code, f"{w['message']} ({a['tag']} {a['field']}: {a['unit']} vs {b['unit']})", loc,
+                                     a["excerpt"] + "\n" + b["excerpt"], evidence=records))
         elif code == "LINE_TOO_LONG":
             gaps.append(CoverageItem(code, f"The line has {w['length']} characters. Lines over {w['limit']} characters are not read, so this row was not compared.",
                                      f"{w['document']}, {describe_location(w['document'], w['line'])}", w["excerpt"]))
         else:
-            gaps.append(CoverageItem(code, REASONS.get(code, code), f"{w['document']}, {describe_location(w['document'], w['line'])}", w["excerpt"]))
+            where = (f"{w['document']}, lines {w['line']}-{w['end_line']}" if w.get("end_line")
+                     else f"{w['document']}, {describe_location(w['document'], w['line'])}")
+            quoted = w.get("detail") in ("MULTILINE_QUOTED_FIELD", "UNCLOSED_QUOTE")   # the engine's own sentence names the span
+            gaps.append(CoverageItem(code, w["reason"] if quoted else REASONS.get(code, code), where, w["excerpt"]))
     for u in result["unmatched"]:
         gaps.append(CoverageItem(
             "UNMATCHED_RECORD",
@@ -237,10 +273,11 @@ def build_view(result: dict, labels: Optional[dict] = None, input_issues: Option
                files: Optional[list] = None) -> AuditView:
     labels = labels or {}
     input_issues = list(input_issues or [])
-    tol = result["tolerance"]
+    requested = result["tolerance"]
+    tol = result.get("effective_tolerance", max(requested, ZERO_TOLERANCE_FLOOR))
     coverage, notes = _coverage_items(result)
-    conflicts = [_conflict_card(f, labels, tol) for f in result["findings"]]
-    equivalents = [_equivalent_card(m, labels, tol) for m in result["matches"]]
+    conflicts = [_conflict_card(f, labels, tol, requested) for f in result["findings"]]
+    equivalents = [_equivalent_card(m, labels, tol, requested) for m in result["matches"]]
     gaps = len(coverage) + len(input_issues)
     n_conf, n_comp = len(conflicts), result["comparisons"]
     metrics = {
@@ -269,7 +306,7 @@ def build_view(result: dict, labels: Optional[dict] = None, input_issues: Option
         headline = f"No conflicts in the {n_comp} compared measurement{'s' if n_comp != 1 else ''}"
         detail = "This covers only rows in the supported format. It is not a certification of the documents."
     return AuditView(verdict, headline, detail, metrics, conflicts, equivalents, coverage, notes, internal, input_issues,
-                     list(files or []), result["scope"], tol, complete)
+                     list(files or []), result["scope"], requested, complete, tol)
 
 
 def _where(ev) -> str:
@@ -312,7 +349,11 @@ def render_markdown(view: AuditView, generated_at: Optional[str] = None) -> str:
                        ("conflicts", "Conflicts"), ("equivalent", "Equivalent after conversion"),
                        ("not_compared", "Items not compared")):
         out.append(f"| {label} | {view.metrics[key]} |")
-    out += ["", f"Allowed difference: {fmt_pct(view.tolerance)}.", ""]
+    if view.effective_tolerance == view.tolerance:
+        out += ["", f"Allowed difference: {fmt_pct(view.tolerance)}.", ""]
+    else:
+        out += ["", f"Allowed difference: requested {fmt_pct(view.tolerance)}, enforced {fmt_pct(view.effective_tolerance)} "
+                    "(values are never compared more finely than 1e-12 relative).", ""]
     out += ["## Conflicts", ""]
     if not view.conflicts:
         out += ["None found among the compared measurements.", ""]
@@ -335,17 +376,38 @@ def render_markdown(view: AuditView, generated_at: Optional[str] = None) -> str:
     for issue in view.input_issues:
         out.append(f"- **Input** — {e(issue['message'])}")
     for item in view.coverage:
+        if len(item.evidence) > 1:                          # one line per original row: file, location, the whole excerpt
+            out.append(f"- **{item.code}** — {e(item.summary)}")
+            out += _evidence_lines(item)
+            continue
         line = f"- **{item.code}** — {e(item.summary)} ({e(item.location)})"
-        out.append(line + (f": {_inline_code(item.excerpt.splitlines()[0])}" if item.excerpt else ""))
+        out.append(line + (f": {_inline_code(_one_line(item.excerpt))}" if item.excerpt else ""))
     if view.notes:
         out += ["", "## Notes (do not reduce coverage)", ""]
         for item in view.notes:
+            if len(item.evidence) > 1:                      # consistent repeats: every original row, as for a gap
+                out.append(f"- **{item.code}** — {e(item.summary)}")
+                out += _evidence_lines(item)
+                continue
             out.append(f"- **{item.code}** — {e(item.summary)} ({e(item.location)})")
     out += ["", "## Limits of this report", "", f"- {e(view.scope)}.",
             "- Only rows in the supported format are read: `TAG | property | number unit`, or comma-separated rows in .csv files.",
             "- SpecForge reports differences between documents. It does not decide which value is correct and does not certify any document.",
             "- PDF locations are page-level. Line numbers for a PDF refer to the extracted text of that page.", ""]
     return "\n".join(out)
+
+
+_LINE_BREAKS = re.compile(r"\r\n|[\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029]")
+
+
+def _one_line(text: str) -> str:
+    """An excerpt on one Markdown line. Every line break is replaced by a visible marker, so nothing is cut off silently."""
+    return _LINE_BREAKS.sub(" \u23ce ", text)
+
+
+def _evidence_lines(item) -> list:
+    """One indented list entry per original row: file, location, the whole excerpt in a code span (line breaks marked)."""
+    return [f"  - {escape_md(r['document'])}, {escape_md(r['location'])}: {_inline_code(_one_line(r['excerpt']))}" for r in item.evidence]
 
 
 def _fence(text: str) -> str:
